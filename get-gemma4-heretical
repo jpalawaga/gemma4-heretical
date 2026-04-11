@@ -44,7 +44,7 @@ if ! command -v ollama &>/dev/null; then
 	echo "ERROR: ollama not found. Install it from https://ollama.com" >&2
 	exit 1
 fi
-OLLAMA_VERSION=$(ollama --version 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1)
+OLLAMA_VERSION=$(ollama --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 if [ -z "$OLLAMA_VERSION" ]; then
 	echo "ERROR: Could not determine Ollama version." >&2
 	exit 1
@@ -99,6 +99,7 @@ PARSER gemma4
 PARAMETER top_k 64
 PARAMETER top_p 0.95
 PARAMETER temperature 1
+PARAMETER num_ctx 65536
 EOF
 
 # Step 3: Register the model with the correct metadata

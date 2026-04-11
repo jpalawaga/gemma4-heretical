@@ -1,0 +1,500 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# dependencies = ["openai"]
+# ///
+#
+# chat — Interactive tool-calling chat with gemma4-heretical via Ollama
+#
+# Requirements:
+#   uv (https://docs.astral.sh/uv/getting-started/installation/)
+#
+# Usage:
+#   ./chat                        # plain chat
+#   ./chat memory.md              # inject file as system prompt at session start
+#   ./chat --heartbeat 60         # send heartbeat every 60 seconds
+#   ./chat memory.md --heartbeat 120
+#
+# Memory:
+#   Memories are stored in ~/.gemma4-heretical/memories.jsonl
+#   The model can save and search memories via tool calls.
+#   All memories are auto-injected into the system prompt at startup.
+#
+# Heartbeats:
+#   When --heartbeat N is set, the chat program sends a periodic [HEARTBEAT]
+#   message to the model. The model is instructed to respond with <EOM> if it
+#   has nothing to say, or with actual content if it wants to surface something.
+#   <EOM> responses are silently filtered; real responses are displayed.
+
+import argparse
+import datetime
+import json
+import os
+import sys
+import threading
+import time
+
+try:
+    from openai import OpenAI
+except ImportError:
+    print("ERROR: openai package not found. Run: pip install openai", file=sys.stderr)
+    sys.exit(1)
+
+client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+MODEL = "gemma4-heretical"
+NUM_CTX = 65536
+DATA_DIR = os.path.expanduser("~/.gemma4-heretical")
+MEMORIES_PATH = os.path.join(DATA_DIR, "memories.jsonl")
+LAST_MESSAGE_PATH = os.path.join(DATA_DIR, "lastmessage.txt")
+LAST_RESPONSE_PATH = os.path.join(DATA_DIR, "lastresponse.txt")
+
+HEARTBEAT_SYSTEM = """
+You will periodically receive [HEARTBEAT] messages. These are automated background signals, not user input.
+Only respond to a heartbeat if you have something genuinely useful to surface — a reminder, a follow-up
+thought, something time-sensitive, or a reflection on the conversation so far.
+If you have nothing meaningful to add, your final response must be exactly: <response-opt-out>
+If you do have something to say, your final response must be the message you want to send.
+Only your final response is shown to the user — any thinking or reasoning before it is discarded.
+""".strip()
+
+# --- Memory ---
+
+def load_memories():
+    if not os.path.exists(MEMORIES_PATH):
+        return []
+    memories = []
+    with open(MEMORIES_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    memories.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    return memories
+
+def save_memory(content, tags=None):
+    os.makedirs(os.path.dirname(MEMORIES_PATH), exist_ok=True)
+    entry = {
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "content": content,
+        "tags": tags or [],
+    }
+    with open(MEMORIES_PATH, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    return entry
+
+def search_memories(query):
+    memories = load_memories()
+    if not memories:
+        return "No memories stored yet."
+    query_lower = query.lower()
+    results = [
+        m for m in memories
+        if query_lower in m["content"].lower()
+        or any(query_lower in t.lower() for t in m.get("tags", []))
+    ]
+    if not results:
+        return f"No memories matching '{query}'."
+    return "\n".join(
+        f"[{m['timestamp']}] {m['content']}" + (f" (tags: {', '.join(m['tags'])})" if m.get("tags") else "")
+        for m in results
+    )
+
+def search_memories_by_tag(tag):
+    memories = load_memories()
+    if not memories:
+        return "No memories stored yet."
+    tag_lower = tag.lower()
+    results = [m for m in memories if any(tag_lower == t.lower() for t in m.get("tags", []))]
+    if not results:
+        return f"No memories tagged '{tag}'."
+    return "\n".join(
+        f"[{m['timestamp']}] {m['content']}" + (f" (tags: {', '.join(m['tags'])})" if m.get("tags") else "")
+        for m in results
+    )
+
+def forget_memory(query):
+    memories = load_memories()
+    kept = [m for m in memories if query.lower() not in m["content"].lower()]
+    removed = len(memories) - len(kept)
+    if removed:
+        with open(MEMORIES_PATH, "w") as f:
+            for m in kept:
+                f.write(json.dumps(m) + "\n")
+    return f"Removed {removed} memory entry(s) matching '{query}'."
+
+def read_file(path):
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return f.read().strip() or None
+
+def write_file(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(content)
+
+def last_exchange_system_block():
+    last_msg = read_file(LAST_MESSAGE_PATH)
+    last_resp = read_file(LAST_RESPONSE_PATH)
+    if not last_msg and not last_resp:
+        return None
+    lines = ["The following are the last message and response from the previous session:"]
+    if last_msg:
+        lines.append(f"Last user message:\n{last_msg}")
+    if last_resp:
+        lines.append(f"Last assistant response:\n{last_resp}")
+    return "\n\n".join(lines)
+
+def memories_as_system_block(memories):
+    if not memories:
+        return None
+    lines = ["The following are things you have remembered from past conversations:"]
+    for m in memories:
+        line = f"- [{m['timestamp']}] {m['content']}"
+        if m.get("tags"):
+            line += f" (tags: {', '.join(m['tags'])})"
+        lines.append(line)
+    return "\n".join(lines)
+
+# --- Tools ---
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Returns the current local date and time.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": (
+                "Save something worth remembering for future conversations. "
+                "Use this for facts about the user, their preferences, important decisions, "
+                "or anything that would be useful context later."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The thing to remember, written as a clear, self-contained statement.",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional topic tags to aid future search (e.g. ['preferences', 'work']).",
+                    },
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_memories",
+            "description": "Search previously saved memories by keyword.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword or phrase to search for.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_memories_by_tag",
+            "description": "Search memories by exact tag match. Use this to retrieve all memories under a specific topic.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tag": {
+                        "type": "string",
+                        "description": "The tag to look up (exact match, case-insensitive).",
+                    }
+                },
+                "required": ["tag"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_last_message",
+            "description": "Returns the last message sent by the user (from any session, including previous ones).",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_last_response",
+            "description": "Returns the last response you gave (from any session, including previous ones).",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_memory",
+            "description": "Remove memories that match a keyword — use when the user asks you to forget something.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword identifying which memories to remove.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+def handle_tool_call(name, arguments):
+    if name == "get_current_time":
+        return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
+    if name == "save_memory":
+        entry = save_memory(arguments.get("content", ""), arguments.get("tags", []))
+        return f"Saved: {entry['content']}"
+    if name == "search_memories":
+        return search_memories(arguments.get("query", ""))
+    if name == "forget_memory":
+        return forget_memory(arguments.get("query", ""))
+    if name == "search_memories_by_tag":
+        return search_memories_by_tag(arguments.get("tag", ""))
+    if name == "get_last_message":
+        return read_file(LAST_MESSAGE_PATH) or "No previous message recorded."
+    if name == "get_last_response":
+        return read_file(LAST_RESPONSE_PATH) or "No previous response recorded."
+    return f"Unknown tool: {name}"
+
+# --- API call (shared by main loop and heartbeat thread) ---
+
+def do_api_call(messages):
+    """Make one full API call (including tool call loop). Returns final reply string or None."""
+    while True:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=TOOLS,
+            extra_body={"options": {"num_ctx": NUM_CTX}, "keep_alive": -1},
+        )
+        msg = response.choices[0].message
+        if msg.tool_calls:
+            messages.append(msg)
+            for tc in msg.tool_calls:
+                args = json.loads(tc.function.arguments or "{}")
+                result = handle_tool_call(tc.function.name, args)
+                if tc.function.name in ("save_memory", "forget_memory"):
+                    print(f"\n(memory: {result})")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+        else:
+            return msg.content or "", response.usage
+
+# --- Heartbeat ---
+
+def heartbeat_worker(messages, lock, interval, stop_event, last_user_message_time):
+    while not stop_event.wait(interval):
+        now = datetime.datetime.now()
+        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        t = last_user_message_time[0]
+        if t is not None:
+            delta = int((now - t).total_seconds())
+            if delta < 60:
+                since = f"{delta}s since last user message"
+            elif delta < 3600:
+                since = f"{delta // 60}m {delta % 60}s since last user message"
+            else:
+                since = f"{delta // 3600}h {(delta % 3600) // 60}m since last user message"
+        else:
+            since = "no user messages yet"
+        hb_msg = {"role": "user", "content": f"[HEARTBEAT | {now_str} | {since}]"}
+        with lock:
+            messages.append(hb_msg)
+            try:
+                reply, _ = do_api_call(messages)
+                # Extract final response — strip any chain-of-thought before it
+                final = reply.strip()
+                if "Response:" in final:
+                    final = final.split("Response:")[-1].strip()
+                if "<response-opt-out>" in final or not final:
+                    # Remove heartbeat — model had nothing to say
+                    # Walk back to remove the hb_msg and any tool messages added
+                    while messages and messages[-1].get("role") != "user":
+                        messages.pop()
+                    if messages and messages[-1].get("content", "").startswith("[HEARTBEAT"):
+                        messages.pop()
+                else:
+                    messages.append({"role": "assistant", "content": final})
+                    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"\n[input interrupted: incoming message | {ts}]\n{final}\n>>> ", end="", flush=True)
+            except Exception as e:
+                # On error, clean up the heartbeat message
+                while messages and messages[-1].get("role") != "user":
+                    messages.pop()
+                if messages and messages[-1].get("content", "").startswith("[HEARTBEAT"):
+                    messages.pop()
+
+# --- Input ---
+
+def read_input():
+    """Read input, collecting all buffered lines (e.g. from a paste)."""
+    import select
+    try:
+        first = input(">>> ")
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if first.strip().lower() in ("exit", "quit"):
+        return None
+    lines = [first]
+    # After each line, wait up to 50ms for more data (handles paste arriving
+    # in chunks). For normal single-line input this adds imperceptible latency.
+    while select.select([sys.stdin], [], [], 0.05)[0]:
+        try:
+            line = sys.stdin.readline()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not line:
+            break
+        lines.append(line.rstrip("\n"))
+    return "\n".join(lines).strip()
+
+def wrap_with_envelope(text, last_message_time):
+    now = datetime.datetime.now()
+    sent_at = now.strftime("%Y-%m-%d %H:%M:%S")
+    if last_message_time is not None:
+        delta = now - last_message_time
+        total_seconds = int(delta.total_seconds())
+        if total_seconds < 60:
+            since = f"{total_seconds}s after previous message"
+        elif total_seconds < 3600:
+            since = f"{total_seconds // 60}m {total_seconds % 60}s since last message"
+        else:
+            since = f"{total_seconds // 3600}h {(total_seconds % 3600) // 60}m since last message"
+    else:
+        since = "first message"
+    return f"[{sent_at} | {since}]\n{text}"
+
+# --- Main ---
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Chat with gemma4-heretical", add_help=False)
+    parser.add_argument("system_file", nargs="?", help="File to inject as system prompt")
+    parser.add_argument("--heartbeat", type=int, default=0, metavar="SECONDS",
+                        help="Send a heartbeat every N seconds (0 = disabled)")
+    return parser.parse_args()
+
+def chat():
+    args = parse_args()
+    messages = []
+    lock = threading.Lock()
+
+    # Optional system prompt from file argument (loaded first — highest priority)
+    if args.system_file:
+        try:
+            with open(args.system_file) as f:
+                system_content = f.read().strip()
+            messages.append({"role": "system", "content": system_content})
+            print(f"(system prompt loaded from {args.system_file})\n")
+        except OSError as e:
+            print(f"ERROR: Could not read {args.system_file}: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # Auto-inject last exchange from previous session
+    last_exchange = last_exchange_system_block()
+    if last_exchange:
+        messages.append({"role": "system", "content": last_exchange})
+        print("(previous session context loaded)\n")
+
+    # Auto-inject memories as system context
+    memories = load_memories()
+    memory_block = memories_as_system_block(memories)
+    if memory_block:
+        messages.append({"role": "system", "content": memory_block})
+        print(f"({len(memories)} memories loaded)\n")
+
+    # Instruct model on memory tool usage
+    messages.append({"role": "system", "content": (
+        "You have access to memory tools: save_memory, search_memories, and forget_memory. "
+        "Use save_memory proactively whenever the user shares something worth remembering across sessions — "
+        "preferences, facts about themselves, decisions, or important context. "
+        "Use search_memories when you need to recall something that might be stored. "
+        "Use search_memories_by_tag to retrieve all memories under a specific topic tag. "
+        "Use forget_memory when the user asks you to forget something. "
+        "Do not wait to be asked — save things as they come up naturally in conversation."
+    )})
+
+    # Inject heartbeat protocol if enabled
+    if args.heartbeat > 0:
+        hb_system = HEARTBEAT_SYSTEM + f"\n\nHeartbeat interval: every {args.heartbeat} seconds."
+        messages.append({"role": "system", "content": hb_system})
+        print(f"(heartbeat every {args.heartbeat}s)\n")
+
+    print(f"Chatting with {MODEL}. Type 'exit' or Ctrl-C to quit.\n")
+    last_message_time = None
+    last_user_message_time = [None]  # mutable container shared with heartbeat thread
+
+    # Start heartbeat thread
+    stop_event = threading.Event()
+    if args.heartbeat > 0:
+        hb_thread = threading.Thread(
+            target=heartbeat_worker,
+            args=(messages, lock, args.heartbeat, stop_event, last_user_message_time),
+            daemon=True,
+        )
+        hb_thread.start()
+
+    try:
+        while True:
+            user_input = read_input()
+            if user_input is None:
+                print()
+                break
+            if not user_input:
+                continue
+
+            if user_input.startswith("**sys:"):
+                system_content = user_input[len("**sys:"):].strip()
+                with lock:
+                    messages.append({"role": "system", "content": system_content})
+                print("(added to system context)\n")
+                continue
+
+            enveloped = wrap_with_envelope(user_input, last_message_time)
+            last_message_time = datetime.datetime.now()
+            last_user_message_time[0] = last_message_time
+
+            write_file(LAST_MESSAGE_PATH, enveloped)
+            with lock:
+                messages.append({"role": "user", "content": enveloped})
+                reply, usage = do_api_call(messages)
+                messages.append({"role": "assistant", "content": reply})
+            write_file(LAST_RESPONSE_PATH, reply)
+
+            if usage:
+                pct = int(usage.prompt_tokens / NUM_CTX * 100)
+                print(f"\n{reply} [{pct}%]\n")
+            else:
+                print(f"\n{reply}\n")
+    finally:
+        stop_event.set()
+
+if __name__ == "__main__":
+    chat()

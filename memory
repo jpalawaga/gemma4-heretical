@@ -1,0 +1,210 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# dependencies = []
+# ///
+#
+# memory — Manage gemma4-heretical memories from the command line
+#
+# Usage:
+#   ./memory list
+#   ./memory add "User prefers dark mode" --tags preferences ui
+#   ./memory search "preferences"
+#   ./memory forget "dark mode"
+
+import json
+import os
+import sys
+import datetime
+
+DATA_DIR = os.path.expanduser("~/.gemma4-heretical")
+MEMORIES_PATH = os.path.join(DATA_DIR, "memories.jsonl")
+LAST_MESSAGE_PATH = os.path.join(DATA_DIR, "lastmessage.txt")
+LAST_RESPONSE_PATH = os.path.join(DATA_DIR, "lastresponse.txt")
+
+def load():
+    if not os.path.exists(MEMORIES_PATH):
+        return []
+    memories = []
+    with open(MEMORIES_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    memories.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    return memories
+
+def write_all(memories):
+    os.makedirs(os.path.dirname(MEMORIES_PATH), exist_ok=True)
+    with open(MEMORIES_PATH, "w") as f:
+        for m in memories:
+            f.write(json.dumps(m) + "\n")
+
+def fmt(m, i=None):
+    prefix = f"{i+1:3}. " if i is not None else "  - "
+    tags = f" [tags: {', '.join(m['tags'])}]" if m.get("tags") else ""
+    return f"{prefix}[{m['timestamp']}]{tags}\n     {m['content']}"
+
+def cmd_list(args):
+    memories = load()
+    if not memories:
+        print("No memories stored.")
+        return
+    for i, m in enumerate(memories):
+        print(fmt(m, i))
+
+def cmd_add(args):
+    if not args:
+        print("Usage: ./memory add \"content\" [--tags tag1 tag2 ...]", file=sys.stderr)
+        sys.exit(1)
+    content = args[0]
+    tags = []
+    if "--tags" in args:
+        tag_start = args.index("--tags") + 1
+        tags = args[tag_start:]
+    os.makedirs(os.path.dirname(MEMORIES_PATH), exist_ok=True)
+    entry = {
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "content": content,
+        "tags": tags,
+    }
+    with open(MEMORIES_PATH, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    print(f"Saved: {content}")
+
+def cmd_search(args):
+    if not args:
+        print("Usage: ./memory search \"query\"", file=sys.stderr)
+        sys.exit(1)
+    query = args[0].lower()
+    memories = load()
+    results = [
+        (i, m) for i, m in enumerate(memories)
+        if query in m["content"].lower() or any(query in t.lower() for t in m.get("tags", []))
+    ]
+    if not results:
+        print(f"No memories matching '{args[0]}'.")
+        return
+    for i, m in results:
+        print(fmt(m, i))
+
+def cmd_forget(args):
+    if not args:
+        print("Usage: ./memory forget \"query\"", file=sys.stderr)
+        sys.exit(1)
+    query = args[0].lower()
+    memories = load()
+    kept = [m for m in memories if query not in m["content"].lower()]
+    removed = len(memories) - len(kept)
+    write_all(kept)
+    print(f"Removed {removed} memory entry(s) matching '{args[0]}'.")
+
+def cmd_edit(args):
+    # Usage: ./memory edit <number> [--content "new content"] [--tags tag1 tag2 ...]
+    if not args:
+        print("Usage: ./memory edit <number> [--content \"...\"] [--tags tag1 tag2 ...]", file=sys.stderr)
+        sys.exit(1)
+    try:
+        idx = int(args[0]) - 1
+    except ValueError:
+        print("ERROR: provide a number from 'list'", file=sys.stderr)
+        sys.exit(1)
+    memories = load()
+    if idx < 0 or idx >= len(memories):
+        print(f"ERROR: no memory #{idx+1}", file=sys.stderr)
+        sys.exit(1)
+    rest = args[1:]
+    if not rest:
+        print("ERROR: provide --content and/or --tags to change", file=sys.stderr)
+        sys.exit(1)
+    m = memories[idx]
+    if "--content" in rest:
+        ci = rest.index("--content")
+        if ci + 1 >= len(rest):
+            print("ERROR: --content requires a value", file=sys.stderr)
+            sys.exit(1)
+        m["content"] = rest[ci + 1]
+    if "--tags" in rest:
+        ti = rest.index("--tags")
+        # collect everything after --tags that isn't another flag
+        tags = []
+        for t in rest[ti + 1:]:
+            if t.startswith("--"):
+                break
+            tags.append(t)
+        m["tags"] = tags
+    write_all(memories)
+    print(fmt(m, idx))
+
+def cmd_delete(args):
+    if not args:
+        print("Usage: ./memory delete <number>  (use 'list' to see numbers)", file=sys.stderr)
+        sys.exit(1)
+    try:
+        idx = int(args[0]) - 1
+    except ValueError:
+        print("ERROR: provide a number from 'list'", file=sys.stderr)
+        sys.exit(1)
+    memories = load()
+    if idx < 0 or idx >= len(memories):
+        print(f"ERROR: no memory #{idx+1}", file=sys.stderr)
+        sys.exit(1)
+    removed = memories.pop(idx)
+    write_all(memories)
+    print(f"Deleted: {removed['content']}")
+
+def cmd_last_message(args):
+    if args and args[0] == "--set":
+        content = " ".join(args[1:])
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(LAST_MESSAGE_PATH, "w") as f:
+            f.write(content)
+        print(f"Set last message: {content}")
+    elif os.path.exists(LAST_MESSAGE_PATH):
+        with open(LAST_MESSAGE_PATH) as f:
+            print(f.read())
+    else:
+        print("No last message recorded.")
+
+def cmd_last_response(args):
+    if args and args[0] == "--set":
+        content = " ".join(args[1:])
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(LAST_RESPONSE_PATH, "w") as f:
+            f.write(content)
+        print(f"Set last response: {content}")
+    elif os.path.exists(LAST_RESPONSE_PATH):
+        with open(LAST_RESPONSE_PATH) as f:
+            print(f.read())
+    else:
+        print("No last response recorded.")
+
+COMMANDS = {
+    "list": cmd_list,
+    "add": cmd_add,
+    "edit": cmd_edit,
+    "search": cmd_search,
+    "forget": cmd_forget,
+    "delete": cmd_delete,
+    "last-message": cmd_last_message,
+    "last-response": cmd_last_response,
+}
+
+def usage():
+    print("Usage: ./memory <command> [args]")
+    print("Commands:")
+    print("  list                                        show all memories")
+    print("  add \"content\" [--tags ...]                add a memory")
+    print("  edit <number> [--content \"...\"] [--tags ...]   edit a memory")
+    print("  search \"query\"                             search memories by keyword")
+    print("  forget \"query\"                             remove all memories matching keyword")
+    print("  delete <number>                            delete a specific memory by list number")
+    print("  last-message [--set \"...\"]                view or override last user message")
+    print("  last-response [--set \"...\"]               view or override last assistant response")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        usage()
+        sys.exit(0 if len(sys.argv) < 2 else 1)
+    COMMANDS[sys.argv[1]](sys.argv[2:])
