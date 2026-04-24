@@ -1,0 +1,245 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# dependencies = []
+# ///
+#
+# schedule — Manage scheduled events from the command line
+#
+# Usage:
+#   ./schedule add <time> <event>
+#   ./schedule list
+#   ./schedule done <id>
+#   ./schedule due [time]
+#
+# All command output is JSON on stdout. Errors and warnings are JSON on stderr.
+
+import fcntl
+import json
+import os
+import sys
+import tempfile
+from contextlib import contextmanager
+from datetime import datetime
+
+DATA_DIR = os.path.expanduser("~/.gemma4-heretical")
+SCHEDULE_PATH = os.path.join(DATA_DIR, "schedule.jsonl")
+LOCK_PATH = SCHEDULE_PATH + ".lock"
+
+
+def _now():
+    return datetime.now().astimezone()
+
+
+def _emit(obj):
+    print(json.dumps(obj))
+
+
+def _warn(msg):
+    print(json.dumps({"warning": msg}), file=sys.stderr)
+
+
+def _error(msg, code=1):
+    print(json.dumps({"error": msg}), file=sys.stderr)
+    sys.exit(code)
+
+
+@contextmanager
+def _locked():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(LOCK_PATH, "w") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def parse_time(s: str) -> datetime:
+    """Parse a user-supplied time string into an aware datetime (local tz)."""
+    s = s.strip()
+    if not s:
+        raise ValueError("empty time")
+    if s.endswith("Z"):
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone()
+    dt = None
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        pass
+    if dt is None:
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+        ):
+            try:
+                dt = datetime.strptime(s, fmt)
+                break
+            except ValueError:
+                continue
+    if dt is None:
+        raise ValueError(f"unrecognized time format: {s!r}")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_now().tzinfo)
+    return dt.astimezone()
+
+
+def load():
+    if not os.path.exists(SCHEDULE_PATH):
+        return []
+    rows = []
+    with open(SCHEDULE_PATH) as f:
+        for lineno, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                _warn(f"skipping malformed line {lineno}: {e}")
+    return rows
+
+
+def write_all(rows):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        dir=DATA_DIR, prefix=".schedule.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r, sort_keys=True) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SCHEDULE_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def next_id(rows):
+    m = 0
+    for r in rows:
+        try:
+            m = max(m, int(r["id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return m + 1
+
+
+def row_time(r):
+    return parse_time(r["time"])
+
+
+def _item(r):
+    return {"id": r["id"], "time": r["time"], "event": r["event"]}
+
+
+def cmd_add(args):
+    if len(args) < 2:
+        _error("Usage: ./schedule add <time> <event>", code=2)
+    when_s = args[0]
+    event = " ".join(args[1:])
+    try:
+        when = parse_time(when_s)
+    except ValueError as e:
+        _error(str(e))
+    with _locked():
+        rows = load()
+        eid = next_id(rows)
+        entry = {
+            "id": eid,
+            "time": when.isoformat(),
+            "event": event,
+        }
+        rows.append(entry)
+        write_all(rows)
+    _emit(entry)
+
+
+def cmd_list(args):
+    if args:
+        _error("Usage: ./schedule list", code=2)
+    rows = load()
+    now = _now()
+    dated = [(row_time(r), r) for r in rows]
+    upcoming = sorted(
+        (r for t, r in dated if t >= now),
+        key=row_time,
+    )
+    _emit([_item(r) for r in upcoming])
+
+
+def cmd_done(args):
+    if len(args) != 1:
+        _error("Usage: ./schedule done <id>", code=2)
+    try:
+        target = int(args[0])
+    except ValueError:
+        _error("id must be an integer")
+    with _locked():
+        rows = load()
+        new_rows = [r for r in rows if int(r.get("id", -1)) != target]
+        if len(new_rows) == len(rows):
+            _error(f"no scheduled item #{target}")
+        write_all(new_rows)
+    _emit({"removed": target})
+
+
+def cmd_due(args):
+    end = None
+    if args:
+        if len(args) != 1:
+            _error("Usage: ./schedule due [time]", code=2)
+        try:
+            end = parse_time(args[0])
+        except ValueError as e:
+            _error(str(e))
+
+    rows = load()
+    now = _now()
+    dated = [(row_time(r), r) for r in rows]
+
+    due = sorted((r for t, r in dated if t <= now), key=row_time)
+    out = {"due": [_item(r) for r in due]}
+    if end is not None:
+        upcoming = sorted(
+            (r for t, r in dated if now < t <= end),
+            key=row_time,
+        )
+        out["upcoming"] = [_item(r) for r in upcoming]
+    _emit(out)
+
+
+COMMANDS = {
+    "add": cmd_add,
+    "list": cmd_list,
+    "done": cmd_done,
+    "due": cmd_due,
+}
+
+
+def usage(exit_code=0):
+    _emit(
+        {
+            "usage": "./schedule <command> [args]",
+            "commands": {
+                "add": "add <time> <event> — schedule an event (returns the new entry)",
+                "list": "list upcoming events (chronological)",
+                "done": "done <id> — remove the scheduled item with this id",
+                "due": "due [time] — due items; with [time], also upcoming until then",
+            },
+        }
+    )
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        usage(0)
+    if sys.argv[1] not in COMMANDS:
+        usage(1)
+    COMMANDS[sys.argv[1]](sys.argv[2:])
