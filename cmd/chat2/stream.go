@@ -14,17 +14,6 @@ import (
 	"time"
 )
 
-const responseOptOutToken = "<response-opt-out>"
-
-func isResponseOptOut(content string) bool {
-	return strings.TrimSpace(content) == responseOptOutToken
-}
-
-func isPotentialResponseOptOut(content string) bool {
-	trimmed := strings.TrimSpace(content)
-	return trimmed == "" || strings.HasPrefix(responseOptOutToken, trimmed)
-}
-
 type completionStreamEventKind int
 
 const (
@@ -120,6 +109,9 @@ func (c *apiClient) completeStreaming(
 	allowHeartbeatScheduling bool,
 	emit func(completionStreamEvent) bool,
 ) (completionResult, error) {
+	if !allowHeartbeatScheduling {
+		return c.completeHeartbeatStreaming(ctx, messages, emit)
+	}
 	working := append([]apiMessage(nil), messages...)
 	var notices []string
 	hadToolCalls := false
@@ -155,16 +147,12 @@ func (c *apiClient) completeStreaming(
 				notices = append(notices, "next heartbeat "+when.Format("2006-01-02 15:04 MST"))
 			}
 		}
-		if strings.TrimSpace(reply) != "" && (allowHeartbeatScheduling || !isResponseOptOut(reply)) {
+		if strings.TrimSpace(reply) != "" {
 			hadVisibleReply = true
 		}
 		if len(message.ToolCalls) == 0 {
-			finalReply := reply
-			if !allowHeartbeatScheduling && isResponseOptOut(finalReply) {
-				finalReply = ""
-			}
 			return completionResult{
-				Reply:           finalReply,
+				Reply:           reply,
 				Reasoning:       message.ReasoningContent,
 				Usage:           roundUsage,
 				Messages:        working,
@@ -274,6 +262,205 @@ func (c *apiClient) completeStreaming(
 		}
 	}
 	return completionResult{}, errors.New("tool call limit exceeded")
+}
+
+const heartbeatEventPrefix = "[HARNESS HEARTBEAT EVENT]\n"
+
+var completeHeartbeatTool = toolSpec{
+	Type: "function",
+	Function: functionSpec{
+		Name:        "complete_heartbeat",
+		Description: "Finish this private heartbeat. Use action none when there is nothing worth surfacing, or action notify with the complete user-facing message. Call this exactly once and alone after any other tools you need.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"action": map[string]any{
+					"type": "string",
+					"enum": []string{"none", "notify"},
+				},
+				"message": map[string]any{
+					"type":        "string",
+					"description": "The complete message to show the user. Required only for action notify.",
+				},
+			},
+			"required":             []string{"action"},
+			"additionalProperties": false,
+		},
+	},
+}
+
+type heartbeatDecision struct {
+	Action  string `json:"action"`
+	Message string `json:"message,omitempty"`
+}
+
+func (c *apiClient) completeHeartbeatStreaming(
+	ctx context.Context,
+	messages []apiMessage,
+	emit func(completionStreamEvent) bool,
+) (completionResult, error) {
+	if len(messages) == 0 {
+		return completionResult{}, errors.New("heartbeat request is missing its event")
+	}
+	event, ok := messages[len(messages)-1].Content.(string)
+	if !ok || messages[len(messages)-1].Role != "system" || !strings.HasPrefix(event, heartbeatEventPrefix) {
+		return completionResult{}, errors.New("heartbeat request must end with a private system event")
+	}
+	baseMessages := append([]apiMessage(nil), messages[:len(messages)-1]...)
+	working := append([]apiMessage(nil), messages...)
+	var notices []string
+	hadToolCalls := false
+	c.nextHeartbeat = nil
+	c.heartbeatSchedulingAllowed = false
+
+	// Heartbeat prose and reasoning are untrusted control-plane output. Only a
+	// validated complete_heartbeat call can become visible to the user.
+	heartbeatEmit := func(event completionStreamEvent) bool {
+		switch event.Kind {
+		case streamReasoningDelta, streamContentDelta:
+			return true
+		default:
+			return emit(event)
+		}
+	}
+
+	for range 8 {
+		request := chatRequest{
+			Model:         c.choice.Model,
+			Messages:      working,
+			Tools:         c.heartbeatTools(),
+			ToolChoice:    "required",
+			Stream:        true,
+			StreamOptions: map[string]any{"include_usage": true},
+		}
+		if c.choice.Backend == backendLlama {
+			request.ReasoningFormat = "none"
+		}
+		if c.choice.Backend == backendOllama {
+			request.Options = map[string]any{"num_ctx": c.context}
+			request.KeepAlive = -1
+		}
+
+		message, roundUsage, err := c.streamChat(ctx, request, heartbeatEmit)
+		if err != nil {
+			return completionResult{}, err
+		}
+		if len(message.ToolCalls) == 0 {
+			working = append(working, message, apiMessage{
+				Role:    "system",
+				Content: "A heartbeat must finish with one structured complete_heartbeat call. Do not answer in prose.",
+			})
+			continue
+		}
+		hadToolCalls = true
+
+		completionIndex := -1
+		for index, call := range message.ToolCalls {
+			if call.Function.Name == completeHeartbeatTool.Function.Name {
+				completionIndex = index
+				break
+			}
+		}
+		if completionIndex >= 0 {
+			call := message.ToolCalls[completionIndex]
+			if len(message.ToolCalls) != 1 {
+				working = append(working, message)
+				for _, mixedCall := range message.ToolCalls {
+					if mixedCall.ID == "" {
+						return completionResult{}, fmt.Errorf("streamed tool call %q has no ID", mixedCall.Function.Name)
+					}
+					working = append(working, apiMessage{
+						Role:       "tool",
+						ToolCallID: mixedCall.ID,
+						Content:    "complete_heartbeat must be called alone. Retry without combining it with another tool.",
+					})
+				}
+				continue
+			}
+			if call.ID == "" {
+				return completionResult{}, errors.New("streamed complete_heartbeat call has no ID")
+			}
+			decision, err := parseHeartbeatDecision(call)
+			if err != nil {
+				working = append(working, message, apiMessage{
+					Role:       "tool",
+					ToolCallID: call.ID,
+					Content:    "Invalid heartbeat decision: " + err.Error(),
+				})
+				continue
+			}
+			result := completionResult{
+				Usage:        roundUsage,
+				Messages:     baseMessages,
+				Notices:      notices,
+				HadToolCalls: hadToolCalls,
+			}
+			if decision.Action == "notify" {
+				result.Reply = decision.Message
+				result.HadVisibleReply = true
+			}
+			return result, nil
+		}
+
+		working = append(working, message)
+		toolNames := make([]string, 0, len(message.ToolCalls))
+		for _, call := range message.ToolCalls {
+			toolNames = append(toolNames, call.Function.Name)
+		}
+		if !emit(completionStreamEvent{Kind: streamToolRound, ToolNames: toolNames}) {
+			return completionResult{}, ctx.Err()
+		}
+		for _, call := range message.ToolCalls {
+			if call.ID == "" {
+				return completionResult{}, fmt.Errorf("streamed tool call %q has no ID", call.Function.Name)
+			}
+			result, notice := c.runTool(call)
+			if notice != "" {
+				notices = append(notices, notice)
+			}
+			working = append(working, apiMessage{Role: "tool", ToolCallID: call.ID, Content: result})
+		}
+	}
+	return completionResult{}, errors.New("heartbeat tool call limit exceeded")
+}
+
+func (c *apiClient) heartbeatTools() []toolSpec {
+	available := c.completionTools(false)
+	result := make([]toolSpec, 0, len(available)+1)
+	for _, tool := range available {
+		if tool.Function.Name == "request_image" {
+			continue
+		}
+		result = append(result, tool)
+	}
+	return append(result, completeHeartbeatTool)
+}
+
+func parseHeartbeatDecision(call toolCall) (heartbeatDecision, error) {
+	var decision heartbeatDecision
+	decoder := json.NewDecoder(strings.NewReader(call.Function.Arguments))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decision); err != nil {
+		return heartbeatDecision{}, err
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return heartbeatDecision{}, errors.New("arguments must contain one JSON object")
+	}
+	decision.Action = strings.TrimSpace(decision.Action)
+	decision.Message = strings.TrimSpace(decision.Message)
+	switch decision.Action {
+	case "none":
+		if decision.Message != "" {
+			return heartbeatDecision{}, errors.New("action none must not include a message")
+		}
+	case "notify":
+		if decision.Message == "" {
+			return heartbeatDecision{}, errors.New("action notify requires a non-empty message")
+		}
+	default:
+		return heartbeatDecision{}, fmt.Errorf("unknown action %q", decision.Action)
+	}
+	return decision, nil
 }
 
 func (c *apiClient) completionTools(allowHeartbeatScheduling bool) []toolSpec {

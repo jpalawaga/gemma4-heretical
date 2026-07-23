@@ -210,9 +210,11 @@ The same flow can run before opening the TUI:
 Heartbeats default to 15 minutes and can be changed at startup with a Go-style
 duration, for example `./chat2 --heartbeat 30m instructions.md`; use
 `--heartbeat 0` to disable them. A real user message arms the heartbeat timer.
-Silent `<response-opt-out>` checks repeat at the configured interval, but once
-the assistant sends a visible response during a heartbeat, checks stop until
-the user responds again. Silent tool calls do not stop the checks. During an
+Private heartbeat runs repeat at the configured interval when the model returns
+the structured `none` decision, but once it returns `notify` with a visible
+message, checks stop until the user responds again. Heartbeat events and their
+tool protocol are ephemeral and never enter the main conversation history;
+silent tool calls do not stop the checks. During an
 ordinary reply, the assistant can call `schedule_next_heartbeat` with a
 relative duration or future RFC3339 timestamp to override the next check. The
 agent is explicitly instructed to invoke it through the structured tool-calling

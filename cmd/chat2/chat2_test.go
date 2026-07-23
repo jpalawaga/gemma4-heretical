@@ -693,13 +693,29 @@ func TestTrailingHeartbeatFallbackIsNarrow(t *testing.T) {
 
 }
 
-func TestHeartbeatOptOutCompletionIsSilent(t *testing.T) {
+func TestStructuredHeartbeatNoneIsSilentAndEphemeral(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeSSE(w,
-			map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"content": "<response-"}}}},
-			map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"content": "opt-out>"}}}},
-		)
+		var request chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.ToolChoice != "required" {
+			t.Errorf("tool choice = %#v, want required", request.ToolChoice)
+		}
+		if request.ReasoningFormat != "none" {
+			t.Errorf("heartbeat reasoning format = %q, want none", request.ReasoningFormat)
+		}
+		last := request.Messages[len(request.Messages)-1]
+		if last.Role != "system" || !strings.HasPrefix(fmt.Sprint(last.Content), heartbeatEventPrefix) {
+			t.Errorf("heartbeat event = %#v", last)
+		}
+		writeSSE(w, map[string]any{"choices": []any{map[string]any{"delta": map[string]any{
+			"tool_calls": []any{map[string]any{
+				"index": 0, "id": "heartbeat-none", "type": "function",
+				"function": map[string]any{"name": "complete_heartbeat", "arguments": `{"action":"none"}`},
+			}},
+		}}}})
 	}))
 	defer server.Close()
 
@@ -709,10 +725,10 @@ func TestHeartbeatOptOutCompletionIsSilent(t *testing.T) {
 		BaseURL: server.URL,
 		APIKey:  "none",
 	}, 16384, testMemoryStore(t), 5*time.Second)
+	base := []apiMessage{{Role: "system", Content: "stable instructions"}, {Role: "user", Content: "hello"}, {Role: "assistant", Content: "hi"}}
+	requestMessages := append(append([]apiMessage(nil), base...), apiMessage{Role: "system", Content: heartbeatEventPrompt(`{"sent_at":"now"}`)})
 	var result completionResult
-	for event := range client.completeStream(context.Background(), []apiMessage{
-		{Role: "user", Content: "[HEARTBEAT]"},
-	}, false) {
+	for event := range client.completeStream(context.Background(), requestMessages, false) {
 		if event.Kind == streamFinished {
 			if event.Err != nil {
 				t.Fatal(event.Err)
@@ -720,8 +736,83 @@ func TestHeartbeatOptOutCompletionIsSilent(t *testing.T) {
 			result = event.Result
 		}
 	}
-	if result.Reply != "" || result.HadVisibleReply {
-		t.Fatalf("opt-out became visible activity: %#v", result)
+	if result.Reply != "" || result.HadVisibleReply || len(result.Messages) != len(base) {
+		t.Fatalf("silent heartbeat result = %#v", result)
+	}
+	for _, message := range result.Messages {
+		if strings.Contains(fmt.Sprint(message.Content), heartbeatEventPrefix) {
+			t.Fatalf("heartbeat event leaked into main history: %#v", result.Messages)
+		}
+	}
+}
+
+func TestStructuredHeartbeatNotifyUsesOnlyValidatedToolMessage(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w, map[string]any{"choices": []any{map[string]any{"delta": map[string]any{
+			"content": "unvalidated heartbeat prose",
+			"tool_calls": []any{map[string]any{
+				"index": 0, "id": "heartbeat-notify", "type": "function",
+				"function": map[string]any{
+					"name":      "complete_heartbeat",
+					"arguments": `{"action":"notify","message":"Your package should arrive soon."}`,
+				},
+			}},
+		}}}})
+	}))
+	defer server.Close()
+
+	client := newAPIClient(modelChoice{
+		Backend: backendLlama,
+		Model:   "gemma4-heretical",
+		BaseURL: server.URL,
+		APIKey:  "none",
+	}, 16384, testMemoryStore(t), 5*time.Second)
+	base := []apiMessage{{Role: "user", Content: "I am waiting for a package."}}
+	messages := append(append([]apiMessage(nil), base...), apiMessage{Role: "system", Content: heartbeatEventPrompt(`{"sent_at":"now"}`)})
+	var (
+		result       completionResult
+		contentDelta bool
+	)
+	for event := range client.completeStream(context.Background(), messages, false) {
+		if event.Kind == streamContentDelta {
+			contentDelta = true
+		}
+		if event.Kind == streamFinished {
+			if event.Err != nil {
+				t.Fatal(event.Err)
+			}
+			result = event.Result
+		}
+	}
+	if contentDelta {
+		t.Fatal("unvalidated heartbeat prose was streamed to the UI")
+	}
+	if result.Reply != "Your package should arrive soon." || !result.HadVisibleReply {
+		t.Fatalf("structured notification result = %#v", result)
+	}
+	if len(result.Messages) != len(base) {
+		t.Fatalf("heartbeat protocol leaked into returned history: %#v", result.Messages)
+	}
+}
+
+func TestHeartbeatDecisionValidation(t *testing.T) {
+	t.Parallel()
+	for name, arguments := range map[string]string{
+		"none with message": `{"action":"none","message":"should not appear"}`,
+		"notify empty":      `{"action":"notify"}`,
+		"unknown action":    `{"action":"later"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseHeartbeatDecision(toolCall{Function: functionCall{Arguments: arguments}})
+			if err == nil {
+				t.Fatalf("accepted invalid heartbeat decision %s", arguments)
+			}
+		})
+	}
+	decision, err := parseHeartbeatDecision(toolCall{Function: functionCall{Arguments: `{"action":"notify","message":"  Time to check in.  "}`}})
+	if err != nil || decision.Message != "Time to check in." {
+		t.Fatalf("valid heartbeat decision = %#v, %v", decision, err)
 	}
 }
 
@@ -1177,52 +1268,48 @@ func TestCompletionStreamUpdatesTUIIncrementally(t *testing.T) {
 	}
 }
 
-func TestHeartbeatOptOutNeverAppearsInLiveTranscriptAndRearms(t *testing.T) {
+func TestSilentStructuredHeartbeatRearmsWithoutChangingHistory(t *testing.T) {
 	m := newAppModel(appConfig{Heartbeat: defaultHeartbeatInterval}, testMemoryStore(t))
 	m.phase = phaseChatting
 	m.width = 80
 	m.height = 30
 	m.resize()
+	base := []apiMessage{{Role: "user", Content: "hello"}, {Role: "assistant", Content: "hi"}}
+	m.messages = append([]apiMessage(nil), base...)
 	m.busy = true
 	m.streamSession = 7
 	m.streamEvents = make(chan completionStreamEvent)
 	m.streamHeartbeat = true
 
-	for _, delta := range []string{"<response-", "opt-out>"} {
-		updated, _ := m.Update(completionStreamMsg{
-			session: 7,
-			events:  m.streamEvents,
-			event:   completionStreamEvent{Kind: streamContentDelta, Delta: delta},
-			ok:      true,
-		})
-		m = updated.(appModel)
-		if strings.Contains(m.viewport.View(), "response-opt-out") || strings.Contains(m.viewport.View(), "<response-") {
-			t.Fatalf("partial opt-out leaked into the live transcript: %q", m.viewport.View())
-		}
-	}
-
 	updated, _ := m.Update(completionStreamMsg{
 		session: 7,
 		events:  m.streamEvents,
-		event:   completionStreamEvent{Kind: streamFinished, Result: completionResult{}},
-		ok:      true,
+		event: completionStreamEvent{
+			Kind:   streamFinished,
+			Result: completionResult{Messages: base, HadToolCalls: true},
+		},
+		ok: true,
 	})
 	m = updated.(appModel)
 	if !m.heartbeatArmed {
 		t.Fatal("silent heartbeat did not schedule the next heartbeat")
 	}
-	if strings.Contains(m.renderTranscript(72), responseOptOutToken) {
-		t.Fatal("opt-out was retained in the completed transcript")
+	if len(m.messages) != len(base) || len(m.transcript) != 0 {
+		t.Fatalf("silent heartbeat changed main history: messages=%#v transcript=%#v", m.messages, m.transcript)
 	}
 }
 
-func TestHeartbeatDoesNotSuppressTextThatMerelyMentionsOptOut(t *testing.T) {
+func TestHeartbeatNotificationPersistsOnlyAssistantMessage(t *testing.T) {
 	m := newAppModel(appConfig{Heartbeat: defaultHeartbeatInterval}, testMemoryStore(t))
 	m.phase = phaseChatting
-	reply := "The literal token <response-opt-out> only opts out when sent by itself."
+	base := []apiMessage{{Role: "user", Content: "Check in later."}, {Role: "assistant", Content: "I will."}}
+	m.messages = append([]apiMessage(nil), base...)
+	reply := "Your scheduled item is due now."
 	updated, _ := m.Update(responseMsg{heartbeat: true, result: completionResult{
 		Reply:           reply,
+		Messages:        base,
 		HadVisibleReply: true,
+		HadToolCalls:    true,
 	}})
 	m = updated.(appModel)
 	if m.heartbeatArmed {
@@ -1230,6 +1317,9 @@ func TestHeartbeatDoesNotSuppressTextThatMerelyMentionsOptOut(t *testing.T) {
 	}
 	if len(m.transcript) != 1 || m.transcript[0].Content != reply {
 		t.Fatalf("heartbeat notification was not surfaced: %#v", m.transcript)
+	}
+	if len(m.messages) != len(base)+1 || m.messages[len(base)].Role != "assistant" || m.messages[len(base)].Content != reply {
+		t.Fatalf("heartbeat protocol leaked or notification was not persisted: %#v", m.messages)
 	}
 }
 
@@ -2027,7 +2117,12 @@ func TestHeartbeatRequestDoesNotAdvertiseSchedulingTool(t *testing.T) {
 			return
 		}
 		requests <- request
-		writeSSE(w, map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"content": responseOptOutToken}}}})
+		writeSSE(w, map[string]any{"choices": []any{map[string]any{"delta": map[string]any{
+			"tool_calls": []any{map[string]any{
+				"index": 0, "id": "heartbeat-none", "type": "function",
+				"function": map[string]any{"name": "complete_heartbeat", "arguments": `{"action":"none"}`},
+			}},
+		}}}})
 	}))
 	defer server.Close()
 
@@ -2038,7 +2133,8 @@ func TestHeartbeatRequestDoesNotAdvertiseSchedulingTool(t *testing.T) {
 		APIKey:  "none",
 	}, 16384, testMemoryStore(t), 5*time.Second)
 	for event := range client.completeStream(context.Background(), []apiMessage{
-		{Role: "user", Content: "[HEARTBEAT]"},
+		{Role: "user", Content: "hello"},
+		{Role: "system", Content: heartbeatEventPrompt(`{"sent_at":"now"}`)},
 	}, false) {
 		if event.Kind == streamFinished && event.Err != nil {
 			t.Fatal(event.Err)
@@ -2046,7 +2142,7 @@ func TestHeartbeatRequestDoesNotAdvertiseSchedulingTool(t *testing.T) {
 	}
 
 	request := <-requests
-	wantTools := len(client.completionTools(false))
+	wantTools := len(client.heartbeatTools())
 	if len(request.Tools) != wantTools {
 		t.Fatalf("heartbeat advertised %d tools, want %d", len(request.Tools), wantTools)
 	}
@@ -2054,6 +2150,12 @@ func TestHeartbeatRequestDoesNotAdvertiseSchedulingTool(t *testing.T) {
 		if tool.Function.Name == "schedule_next_heartbeat" {
 			t.Fatal("heartbeat request advertised schedule_next_heartbeat")
 		}
+		if tool.Function.Name == "request_image" {
+			t.Fatal("heartbeat request advertised request_image")
+		}
+	}
+	if !hasTool(request.Tools, "complete_heartbeat") || request.ToolChoice != "required" {
+		t.Fatalf("heartbeat completion was not structurally required: tools=%#v choice=%#v", request.Tools, request.ToolChoice)
 	}
 }
 

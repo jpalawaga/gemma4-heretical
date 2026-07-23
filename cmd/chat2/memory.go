@@ -351,6 +351,7 @@ You also have native scheduling tools: schedule_item, list_scheduled_items, and 
 Heartbeat scheduling protocol:
 - ONLY during a regular user turn (not heartbeat), you may use the schedule_next_heartbeat toolcall. Do NOT put the toolcall in the response body.
 - Never type the tool name, a pseudo-call, or its JSON arguments as response prose. If you cannot issue a structured tool call, omit it and continue normally; the harness will use its configured default interval.
+- During a heartbeat, finish only through the required complete_heartbeat tool. The heartbeat event, tool protocol, and silent result are private and ephemeral; use action notify only for a complete message worth surfacing to the user.
 - A heartbeat without a visible assistant response recurs at the default interval even if you use tools. A visible heartbeat response stops further heartbeats until the user responds.
 
 You may call request_image to request the user send a photo. State exactly what image would help and why. The user must explicitly approve capture or choose a file; never imply that you can see through the camera or that an image was supplied until the tool result confirms it.`

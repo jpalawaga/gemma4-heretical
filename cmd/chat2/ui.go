@@ -367,7 +367,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					Meta:       "tool round",
 				})
 			}
-			if strings.TrimSpace(msg.event.Content) != "" && !(m.streamHeartbeat && isResponseOptOut(msg.event.Content)) {
+			if strings.TrimSpace(msg.event.Content) != "" {
 				m.transcript = append(m.transcript, transcriptMessage{
 					Role:       "assistant",
 					Content:    msg.event.Content,
@@ -404,7 +404,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.stopCompletionStream()
 			if heartbeat && msg.event.Err == nil {
 				trimmed := strings.TrimSpace(msg.event.Result.Reply)
-				if trimmed == "" || isResponseOptOut(trimmed) {
+				if trimmed == "" {
 					msg.event.Result.Reply = ""
 				}
 			}
@@ -579,12 +579,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.busy = true
 			m.status = "Heartbeat…"
 			now := msg.at
-			heartbeat := fmt.Sprintf(
-				"[HEARTBEAT | %s | %s]",
-				humanTimestamp(now, now.Location()),
-				timeSinceUser(now, m.lastSent),
-			)
-			commands = append(commands, m.sendCmd(m.responseEnvelope(heartbeat, now), nil, true))
+			commands = append(commands, m.sendCmd(m.responseEnvelope("", now), nil, true))
 		} else if m.cfg.Heartbeat > 0 {
 			commands = append(commands, m.armDefaultHeartbeat(msg.at))
 		}
@@ -1354,9 +1349,16 @@ func (m *appModel) toggleDebug() {
 func (m *appModel) sendCmd(prompt string, images []string, heartbeat bool) tea.Cmd {
 	messages := append([]apiMessage(nil), m.messages...)
 	if heartbeat {
-		messages = append(messages, apiMessage{Role: "user", Content: prompt})
+		messages = append(messages, apiMessage{Role: "system", Content: heartbeatEventPrompt(prompt)})
 	}
 	return m.startCompletionStream(messages, prompt, images, heartbeat, false)
+}
+
+func heartbeatEventPrompt(metadata string) string {
+	return heartbeatEventPrefix + `
+This is a private control-plane timer event, not a user message and not a new conversation stage. The preceding conversation is unchanged. Use tools only if the metadata gives a concrete reason. If nothing new is due or worth surfacing, immediately call complete_heartbeat with action "none". Otherwise call it with action "notify" and the complete user-facing message. Call complete_heartbeat exactly once and alone; do not answer in prose.
+
+` + strings.TrimSpace(metadata)
 }
 
 func (m *appModel) startCompletionStream(messages []apiMessage, prompt string, images []string, heartbeat, visibleReply bool) tea.Cmd {
@@ -1692,7 +1694,7 @@ func (m *appModel) refreshTranscript() {
 		})
 	}
 	visibleStreamAnswer := hidePotentialTrailingHeartbeatDirective(m.streamAnswer)
-	if visibleStreamAnswer != "" && !(m.streamHeartbeat && isPotentialResponseOptOut(m.streamAnswer)) {
+	if visibleStreamAnswer != "" {
 		messages = append(messages, transcriptMessage{
 			Role:       "assistant_stream",
 			Content:    visibleStreamAnswer,

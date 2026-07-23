@@ -34,6 +34,7 @@ type chatRequest struct {
 	Model           string         `json:"model"`
 	Messages        []apiMessage   `json:"messages"`
 	Tools           []toolSpec     `json:"tools"`
+	ToolChoice      any            `json:"tool_choice,omitempty"`
 	Options         map[string]any `json:"options,omitempty"`
 	KeepAlive       any            `json:"keep_alive,omitempty"`
 	Stream          bool           `json:"stream,omitempty"`
