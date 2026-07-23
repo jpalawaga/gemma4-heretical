@@ -1,5 +1,9 @@
 # Using gemma4-heretical with OpenClaw
 
+> Legacy guide: this document describes the older dense Gemma 4 31B MLX
+> experiment. For the current 26B-A4B Ollama and llama.cpp/MTP paths, including
+> image input, start with [README.md](README.md).
+
 Guide to connecting the MLX 8-bit abliterated Gemma 4 31B model to OpenClaw
 on macOS Apple Silicon.
 
@@ -149,7 +153,7 @@ openclaw agent --message "Hello, are you working?"
 If you prefer Ollama (simpler, no server to manage):
 
 ```bash
-./get-gemma4-heretical          # downloads GGUF Q8_0, registers in Ollama
+./get-gemma4-heretical          # downloads QAT Q4_K_M, registers in Ollama
 ollama run gemma4-heretical     # interactive chat
 ollama serve                    # or run as API server on localhost:11434
 ```

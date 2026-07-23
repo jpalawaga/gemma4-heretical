@@ -3,7 +3,7 @@
 # dependencies = ["openai"]
 # ///
 #
-# chat — Interactive tool-calling chat with gemma4-heretical via Ollama
+# chat — Interactive multimodal, tool-calling chat with gemma4-heretical
 #
 # Requirements:
 #   uv (https://docs.astral.sh/uv/getting-started/installation/)
@@ -11,6 +11,8 @@
 # Usage:
 #   ./chat                        # plain chat
 #   ./chat memory.md              # inject file as system prompt at session start
+#   ./chat --backend llama        # llama.cpp with vision + MTP
+#   ./chat --backend llama --image photo.jpg
 #   ./chat --heartbeat 60         # send heartbeat every 60 seconds
 #   ./chat memory.md --heartbeat 120
 #
@@ -26,12 +28,16 @@
 #   <EOM> responses are silently filtered; real responses are displayed.
 
 import argparse
+import base64
 import datetime
 import json
+import mimetypes
 import os
+import shlex
 import sys
 import threading
 import time
+from pathlib import Path
 
 try:
     from openai import OpenAI
@@ -39,13 +45,34 @@ except ImportError:
     print("ERROR: openai package not found. Run: pip install openai", file=sys.stderr)
     sys.exit(1)
 
-client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+client = None
+BACKEND = "ollama"
 MODEL = "gemma4-heretical"
-NUM_CTX = 65536
+NUM_CTX = 16384
 DATA_DIR = os.path.expanduser("~/.gemma4-heretical")
 MEMORIES_PATH = os.path.join(DATA_DIR, "memories.jsonl")
 LAST_MESSAGE_PATH = os.path.join(DATA_DIR, "lastmessage.txt")
 LAST_RESPONSE_PATH = os.path.join(DATA_DIR, "lastresponse.txt")
+
+BACKEND_DEFAULTS = {
+    "ollama": {
+        "base_url": "http://127.0.0.1:11434/v1",
+        "api_key": "ollama",
+    },
+    "llama": {
+        "base_url": "http://127.0.0.1:8082/v1",
+        "api_key": "none",
+    },
+}
+
+IMAGE_MIME_TYPES = {
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".tga": "image/x-tga",
+}
 
 HEARTBEAT_SYSTEM = """
 You will periodically receive [HEARTBEAT] messages. These are automated background signals, not user input.
@@ -286,11 +313,18 @@ def handle_tool_call(name, arguments):
 def do_api_call(messages):
     """Make one full API call (including tool call loop). Returns final reply string or None."""
     while True:
+        request = {
+            "model": MODEL,
+            "messages": messages,
+            "tools": TOOLS,
+        }
+        if BACKEND == "ollama":
+            request["extra_body"] = {
+                "options": {"num_ctx": NUM_CTX},
+                "keep_alive": -1,
+            }
         response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=TOOLS,
-            extra_body={"options": {"num_ctx": NUM_CTX}, "keep_alive": -1},
+            **request,
         )
         msg = response.choices[0].message
         if msg.tool_calls:
@@ -376,6 +410,98 @@ def read_input():
         lines.append(line.rstrip("\n"))
     return "\n".join(lines).strip()
 
+def resolve_image(path):
+    """Validate an image path and return its absolute path."""
+    candidate = Path(path).expanduser()
+    try:
+        candidate = candidate.resolve(strict=True)
+    except OSError as e:
+        raise ValueError(f"Cannot read image '{path}': {e}") from e
+    if not candidate.is_file():
+        raise ValueError(f"Image is not a file: {candidate}")
+    if candidate.suffix.lower() not in IMAGE_MIME_TYPES:
+        supported = ", ".join(sorted(IMAGE_MIME_TYPES))
+        raise ValueError(f"Unsupported image type '{candidate.suffix}'. Supported: {supported}")
+    return str(candidate)
+
+def image_content_part(path):
+    """Encode a local image as an OpenAI-compatible data URL content part."""
+    suffix = Path(path).suffix.lower()
+    mime_type = IMAGE_MIME_TYPES.get(suffix) or mimetypes.guess_type(path)[0]
+    with open(path, "rb") as image_file:
+        encoded = base64.b64encode(image_file.read()).decode("ascii")
+    return {
+        "type": "image_url",
+        "image_url": {
+            "url": f"data:{mime_type};base64,{encoded}",
+        },
+    }
+
+def user_message_content(text, image_paths):
+    """Create a plain-text or multimodal user message."""
+    if not image_paths:
+        return text
+    content = [{"type": "text", "text": text}]
+    content.extend(image_content_part(path) for path in image_paths)
+    return content
+
+def handle_local_command(text, pending_images):
+    """Handle slash commands. Returns True when the input was consumed."""
+    command, separator, argument = text.partition(" ")
+    command = command.lower()
+
+    if command == "/image":
+        if not separator or not argument.strip():
+            print("Usage: /image PATH [PATH ...]\n")
+            return True
+        try:
+            paths = shlex.split(argument)
+        except ValueError as e:
+            print(f"Invalid image path: {e}\n")
+            return True
+        if not paths:
+            print("Usage: /image PATH [PATH ...]\n")
+            return True
+        try:
+            resolved = [resolve_image(path) for path in paths]
+        except ValueError as e:
+            print(f"{e}\n")
+            return True
+        pending_images.extend(resolved)
+        for path in resolved:
+            print(f"(queued image: {path})")
+        print()
+        return True
+
+    if command == "/images":
+        if pending_images:
+            print("Images queued for the next message:")
+            for path in pending_images:
+                print(f"  {path}")
+        else:
+            print("No images queued.")
+        print()
+        return True
+
+    if command == "/clear-images":
+        count = len(pending_images)
+        pending_images.clear()
+        print(f"(cleared {count} queued image(s))\n")
+        return True
+
+    if command == "/help":
+        print(
+            "Commands:\n"
+            "  /image PATH [PATH ...]  attach image(s) to the next message\n"
+            "  /images                 list queued images\n"
+            "  /clear-images           discard queued images\n"
+            "  **sys: TEXT             add text to system context\n"
+            "  exit                     end the session\n"
+        )
+        return True
+
+    return False
+
 def wrap_with_envelope(text, last_message_time):
     now = datetime.datetime.now()
     sent_at = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -395,16 +521,79 @@ def wrap_with_envelope(text, last_message_time):
 # --- Main ---
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Chat with gemma4-heretical", add_help=False)
+    parser = argparse.ArgumentParser(description="Chat with gemma4-heretical")
     parser.add_argument("system_file", nargs="?", help="File to inject as system prompt")
+    parser.add_argument(
+        "--backend",
+        choices=sorted(BACKEND_DEFAULTS),
+        default=os.environ.get("GEMMA4_BACKEND", "ollama"),
+        help="Inference backend (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get("GEMMA4_BASE_URL"),
+        help="Override the backend's OpenAI-compatible base URL",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("GEMMA4_API_KEY"),
+        help="Override the API key (local defaults are otherwise used)",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("GEMMA4_MODEL", "gemma4-heretical"),
+        help="Model ID sent to the server (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--context",
+        type=int,
+        default=os.environ.get("GEMMA4_CONTEXT", "16384"),
+        metavar="TOKENS",
+        help="Context window used for reporting and Ollama requests (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--image",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Attach a local image to the first user message (repeatable)",
+    )
     parser.add_argument("--heartbeat", type=int, default=0, metavar="SECONDS",
                         help="Send a heartbeat every N seconds (0 = disabled)")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.backend not in BACKEND_DEFAULTS:
+        parser.error(
+            f"invalid backend from GEMMA4_BACKEND: {args.backend!r}; "
+            f"choose from {', '.join(sorted(BACKEND_DEFAULTS))}"
+        )
+    return args
 
 def chat():
+    global BACKEND, MODEL, NUM_CTX, client
+
     args = parse_args()
+    if args.context <= 0:
+        print("ERROR: --context must be greater than zero.", file=sys.stderr)
+        sys.exit(2)
+    if args.heartbeat < 0:
+        print("ERROR: --heartbeat cannot be negative.", file=sys.stderr)
+        sys.exit(2)
+
+    BACKEND = args.backend
+    MODEL = args.model
+    NUM_CTX = args.context
+    backend_defaults = BACKEND_DEFAULTS[BACKEND]
+    base_url = args.base_url or backend_defaults["base_url"]
+    api_key = args.api_key or backend_defaults["api_key"]
+    client = OpenAI(base_url=base_url, api_key=api_key)
+
     messages = []
     lock = threading.Lock()
+    try:
+        pending_images = [resolve_image(path) for path in args.image]
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(2)
 
     # Optional system prompt from file argument (loaded first — highest priority)
     if args.system_file:
@@ -447,7 +636,11 @@ def chat():
         messages.append({"role": "system", "content": hb_system})
         print(f"(heartbeat every {args.heartbeat}s)\n")
 
-    print(f"Chatting with {MODEL}. Type 'exit' or Ctrl-C to quit.\n")
+    print(f"Chatting with {MODEL} via {BACKEND} ({base_url}).")
+    print("Use /image PATH to attach an image, /help for commands, or exit to quit.")
+    if pending_images:
+        print(f"({len(pending_images)} image(s) queued for the first message)")
+    print()
     last_message_time = None
     last_user_message_time = [None]  # mutable container shared with heartbeat thread
 
@@ -470,6 +663,19 @@ def chat():
             if not user_input:
                 continue
 
+            # A terminal paste can contain the /image command and its question
+            # in one buffered read. Queue from the first line and immediately
+            # submit the remaining lines as the message.
+            command_input = user_input
+            pasted_message = ""
+            if user_input.lower().startswith("/image ") and "\n" in user_input:
+                command_input, pasted_message = user_input.split("\n", 1)
+                pasted_message = pasted_message.strip()
+            if handle_local_command(command_input, pending_images):
+                if not pasted_message:
+                    continue
+                user_input = pasted_message
+
             if user_input.startswith("**sys:"):
                 system_content = user_input[len("**sys:"):].strip()
                 with lock:
@@ -481,11 +687,20 @@ def chat():
             last_message_time = datetime.datetime.now()
             last_user_message_time[0] = last_message_time
 
-            write_file(LAST_MESSAGE_PATH, enveloped)
+            attached_images = list(pending_images)
+            saved_message = enveloped
+            if attached_images:
+                names = ", ".join(Path(path).name for path in attached_images)
+                saved_message += f"\n[Attached images: {names}]"
+            write_file(LAST_MESSAGE_PATH, saved_message)
             with lock:
-                messages.append({"role": "user", "content": enveloped})
+                messages.append({
+                    "role": "user",
+                    "content": user_message_content(enveloped, attached_images),
+                })
                 reply, usage = do_api_call(messages)
                 messages.append({"role": "assistant", "content": reply})
+            pending_images.clear()
             write_file(LAST_RESPONSE_PATH, reply)
 
             if usage:

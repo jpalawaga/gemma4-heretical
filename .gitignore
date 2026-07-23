@@ -7,6 +7,12 @@ gemma-4-31B-it-heretic/
 # MLX converted model (large)
 gemma4-heretical-mlx-8bit/
 
+# Downloaded GGUF model, vision projector, and MTP head
+models/
+
+# Local Go build output
+/.build/
+
 # Heretic source clone
 heretic-src/
 
@@ -36,3 +42,12 @@ __pycache__/
 # Editor
 CLAUDE.md
 AGENTS.md
+
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# Private local prompt/context files
+memory.md
+memory.back

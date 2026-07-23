@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# Download the GGUF files needed for llama.cpp vision + MTP inference.
+#
+# Files are stored under ./models by default. Override with GEMMA4_MODEL_DIR.
+
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MODEL_DIR="${GEMMA4_MODEL_DIR:-${PROJECT_DIR}/models/gemma4-26b-a4b}"
+HF_REPO="HauhauCS/Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-MTP"
+HF_BASE="https://huggingface.co/${HF_REPO}/resolve/main"
+
+MODEL_FILE="Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf"
+MMPROJ_FILE="mmproj-Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-BF16.gguf"
+MTP_FILE="mtp-gemma-4-26B-A4B-it.gguf"
+
+if ! command -v curl >/dev/null 2>&1; then
+	echo "ERROR: curl is required." >&2
+	exit 1
+fi
+
+mkdir -p "$MODEL_DIR"
+
+download() {
+	local filename="$1"
+	local size="$2"
+	local destination="${MODEL_DIR}/${filename}"
+	local partial="${destination}.part"
+
+	if [ -f "$destination" ]; then
+		echo "Already downloaded: ${filename}"
+		return
+	fi
+
+	echo "Downloading ${filename} (${size})..."
+	curl \
+		--fail \
+		--location \
+		--retry 3 \
+		--continue-at - \
+		--output "$partial" \
+		"${HF_BASE}/${filename}"
+	mv "$partial" "$destination"
+}
+
+echo "=== llama.cpp model download ==="
+echo "Destination: ${MODEL_DIR}"
+echo "Total:       ~18.2 GB"
+echo ""
+
+download "$MODEL_FILE" "16.8 GB"
+download "$MMPROJ_FILE" "1.2 GB"
+download "$MTP_FILE" "252 MB"
+
+echo ""
+echo "=== Download complete ==="
+echo ""
+echo "Start the vision + MTP server:"
+echo "  ./serve-llama"
+echo ""
+echo "Then connect chat:"
+echo "  ./chat --backend llama"

@@ -1,45 +1,37 @@
 #!/usr/bin/env bash
 #
-# get-gemma4-heretical — Create an uncensored Gemma 4 31B model in Ollama
+# get-gemma4-heretical — Install the balanced uncensored Gemma 4 26B-A4B in Ollama
 #
 # What this does:
-#   Downloads an "abliterated" (uncensored) Gemma 4 31B model and registers
-#   it in Ollama with the correct chat template so it actually works.
+#   Downloads the QAT Q4_K_M GGUF plus its vision projector and registers it
+#   as gemma4-heretical with the correct Gemma 4 renderer, parser, context,
+#   and sampling parameters.
 #
 # Source model:
-#   trohrbaugh/gemma-4-31b-it-heretic-ara (HuggingFace)
-#   - Abliterated using p-e-w/heretic with Arbitrary-Rank Ablation (ARA)
-#   - Refusals: 5/100 (down from 98/100 on stock model)
-#   - KL divergence: 0.012 (virtually no quality loss)
-#   GGUF quantization by jfiekdjdk (imatrix-based, high quality)
+#   HauhauCS/Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-MTP
+#   - 26B parameter mixture-of-experts model with 4B active parameters
+#   - Quantization-aware-trained for Q4_K_M
+#   - Balanced uncensoring tuned for reasoning, coding, and conversation
 #
-# The problem this solves:
-#   Community GGUF uploads of Gemma 4 models ship with an incorrect chat
-#   template (using <|turn>/<turn|> delimiters instead of Gemma 4's native
-#   format). Ollama has built-in Gemma 4 support via RENDERER/PARSER, but
-#   the HuggingFace GGUFs don't set it — so the model just outputs "---"
-#   on repeat. This script pulls the GGUF, then re-registers it with the
-#   correct renderer/parser metadata.
+# Hugging Face's Ollama manifest includes the separate vision projector. The
+# MTP draft head still requires llama.cpp; use get-gemma4-llama and serve-llama
+# for speculative decoding.
 #
 # Requirements:
-#   - Ollama 0.20.2+ (https://ollama.com)
-#   - ~33 GB disk space (Q8_0 quantization)
-#   - ~33 GB RAM to run (or use Q4_K_M below for ~19 GB)
+#   - Ollama 0.30.6+ (https://ollama.com)
+#   - ~18 GB disk space for the model and vision projector
+#   - A machine with at least ~24 GB available memory
 #
 # Usage:
 #   chmod +x get-gemma4-heretical
 #   ./get-gemma4-heretical
 #   ollama run gemma4-heretical
-#
-# To use a smaller quantization (less RAM, slightly lower quality):
-#   ./get-gemma4-heretical Q4_K_M    # ~19 GB (good balance)
-#   ./get-gemma4-heretical Q6_K      # ~25 GB (higher quality)
-#   ./get-gemma4-heretical IQ4_NL    # ~17 GB (smallest, imatrix)
 
-set -u
+set -eu
 
-# Check Ollama version (minimum 0.20.2)
-MIN_OLLAMA_VERSION="0.20.2"
+# Gemma 4 QAT support shipped in Ollama 0.30.6. Earlier releases may inspect
+# the GGUF metadata but still fail when the runner tries to load it.
+MIN_OLLAMA_VERSION="0.30.6"
 if ! command -v ollama &>/dev/null; then
 	echo "ERROR: ollama not found. Install it from https://ollama.com" >&2
 	exit 1
@@ -58,54 +50,74 @@ if ! version_ge "$OLLAMA_VERSION" "$MIN_OLLAMA_VERSION"; then
 	exit 1
 fi
 
-QUANT="${1:-Q8_0}"
-HF_REPO="hf.co/jfiekdjdk/gemma-4-31b-it-heretic-ara-gguf"
+QUANT="Q4_K_M"
+HF_REPO="hf.co/HauhauCS/Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-MTP"
 MODEL_NAME="gemma4-heretical"
 
 echo "=== gemma4-heretical setup ==="
 echo ""
 echo "Quantization: ${QUANT}"
 echo "Source:       ${HF_REPO}"
+echo "Ollama name:  ${MODEL_NAME}"
 echo ""
 
 # Step 1: Pull the GGUF from HuggingFace
-echo "[1/3] Pulling GGUF from HuggingFace (this downloads ~17-33 GB)..."
-ollama pull "${HF_REPO}:${QUANT}"
-if [ $? -ne 0 ]; then
+echo "[1/3] Pulling model and vision projector from HuggingFace (~18 GB)..."
+if ! ollama pull "${HF_REPO}:${QUANT}"; then
 	echo "ERROR: Failed to pull model. Check your internet connection and that" >&2
 	echo "       Ollama is enabled at https://huggingface.co/settings/local-apps" >&2
 	exit 1
 fi
 
-# Step 2: Extract the blob path and create a Modelfile with the correct template
+# Step 2: Copy both FROM layers from the pulled manifest. Ollama currently
+# resolves "FROM <model name>" to only the language-model layer during create,
+# which silently drops the separately packaged vision projector.
 echo ""
 echo "[2/3] Creating Modelfile with correct Gemma 4 renderer..."
-BLOB_PATH=$(ollama show "${HF_REPO}:${QUANT}" --modelfile 2>/dev/null | grep '^FROM /' | head -1 | sed 's/^FROM //')
-if [ -z "$BLOB_PATH" ]; then
-	echo "ERROR: Could not determine blob path from ollama show" >&2
+
+MODELFILE=$(mktemp)
+SOURCE_MODELFILE=$(mktemp)
+cleanup() {
+	rm -f "$MODELFILE" "$SOURCE_MODELFILE"
+}
+trap cleanup EXIT
+
+if ! ollama show --modelfile "${HF_REPO}:${QUANT}" > "$SOURCE_MODELFILE"; then
+	echo "ERROR: Could not inspect the pulled Ollama manifest." >&2
 	exit 1
 fi
 
-MODELFILE=$(mktemp)
+FROM_LAYERS=$(grep '^FROM ' "$SOURCE_MODELFILE" || true)
+FROM_COUNT=$(printf '%s\n' "$FROM_LAYERS" | grep -c '^FROM ' || true)
+if [ "$FROM_COUNT" -lt 2 ]; then
+	echo "ERROR: Expected language-model and vision-projector layers, found ${FROM_COUNT}." >&2
+	echo "       Refusing to create a text-only alias by accident." >&2
+	exit 1
+fi
+
 cat > "$MODELFILE" <<EOF
-# Gemma 4 31B abliterated (trohrbaugh/heretic-ara, ${QUANT})
-# The RENDERER and PARSER lines are the key fix — they tell Ollama to use
-# its built-in Gemma 4 chat formatting instead of the broken template
-# baked into the GGUF metadata.
-FROM ${BLOB_PATH}
+# Gemma 4 26B-A4B QAT Balanced Uncensored (${QUANT})
+${FROM_LAYERS}
+REQUIRES ${MIN_OLLAMA_VERSION}
 TEMPLATE {{ .Prompt }}
 RENDERER gemma4
 PARSER gemma4
 PARAMETER top_k 64
-PARAMETER top_p 0.95
-PARAMETER temperature 1
-PARAMETER num_ctx 65536
+PARAMETER top_p 0.9
+PARAMETER min_p 0.05
+PARAMETER temperature 0.6
+PARAMETER repeat_penalty 1.1
+PARAMETER num_ctx 16384
 EOF
 
 # Step 3: Register the model with the correct metadata
 echo "[3/3] Registering as '${MODEL_NAME}'..."
-ollama create "${MODEL_NAME}" -f "$MODELFILE"
-rm -f "$MODELFILE"
+if ! ollama create "${MODEL_NAME}" -f "$MODELFILE"; then
+	echo "ERROR: Failed to register ${MODEL_NAME}." >&2
+	exit 1
+fi
+trap - EXIT
+cleanup
 
 echo ""
 echo "=== Done! ==="
@@ -114,8 +126,12 @@ echo "Run with:"
 echo "  ollama run ${MODEL_NAME}"
 echo ""
 echo "Model details:"
-echo "  Base:        google/gemma-4-31B-it"
-echo "  Abliteration: trohrbaugh/heretic-ara (ARA method)"
-echo "  Refusals:    5/100 (vs 98/100 stock)"
-echo "  KL div:      0.012 (near-zero quality loss)"
-echo "  Quant:       ${QUANT} (imatrix by jfiekdjdk)"
+echo "  Base:        google/gemma-4-26B-A4B-it"
+echo "  Variant:     HauhauCS Balanced Uncensored"
+echo "  Quant:       ${QUANT} (QAT)"
+echo "  Context:     16384"
+echo ""
+echo "For MTP acceleration through llama.cpp:"
+echo "  ./get-gemma4-llama"
+echo "  ./serve-llama"
+echo "  ./chat --backend llama"

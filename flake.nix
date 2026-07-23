@@ -1,5 +1,5 @@
 {
-  description = "Gemma 4 31B abliteration via heretic";
+  description = "Local Gemma 4 26B-A4B chat with Ollama and llama.cpp";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -19,6 +19,9 @@
             python.pkgs.virtualenv
             pkgs.git
             pkgs.cacert
+            pkgs.go
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.imagesnap
           ];
 
           shellHook = ''
@@ -38,11 +41,15 @@
             fi
 
             echo ""
-            echo "  gemma4-heretical dev shell"
+            echo "  gemma4-heretical dev shell (legacy DIY abliteration tools)"
             echo "  Python: $(python --version)"
             echo "  heretic: $(pip show heretic-llm 2>/dev/null | grep Version || echo 'installing...')"
             echo ""
-            echo "  ./abliterate    — run heretic on gemma-4-31B-it"
+            echo "  ./get-gemma4-heretical — install the 26B-A4B model in Ollama"
+            echo "  ./get-gemma4-llama — download the vision + MTP GGUF files"
+            echo "  ./serve-llama — serve vision + MTP through llama.cpp"
+            echo "  go build -o chat2 ./cmd/chat2 — build the Charm TUI"
+            echo "  ./abliterate    — run legacy heretic flow on gemma-4-31B-it"
             echo "  ./convert-to-ollama — convert result to GGUF + import to Ollama"
             echo ""
           '';

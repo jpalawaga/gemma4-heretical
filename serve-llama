@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+#
+# Serve Gemma 4 through llama.cpp with vision and MTP enabled.
+#
+# Usage:
+#   ./serve-llama
+#   ./serve-llama --no-mtp       # benchmark normal decoding
+#   ./serve-llama --no-vision    # text-only, lower memory use
+#   ./serve-llama -- --verbose   # pass additional llama-server arguments
+#
+# Environment:
+#   GEMMA4_MODEL_DIR  model directory created by get-gemma4-llama
+#   GEMMA4_CONTEXT    context length (default: 16384)
+#   GEMMA4_PORT       listening port (default: 8082)
+
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MODEL_DIR="${GEMMA4_MODEL_DIR:-${PROJECT_DIR}/models/gemma4-26b-a4b}"
+CONTEXT="${GEMMA4_CONTEXT:-16384}"
+PORT="${GEMMA4_PORT:-8082}"
+
+MODEL_FILE="${MODEL_DIR}/Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf"
+MMPROJ_FILE="${MODEL_DIR}/mmproj-Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-BF16.gguf"
+MTP_FILE="${MODEL_DIR}/mtp-gemma-4-26B-A4B-it.gguf"
+
+USE_MTP=1
+USE_VISION=1
+EXTRA_ARGS=()
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--no-mtp)
+			USE_MTP=0
+			shift
+			;;
+		--no-vision)
+			USE_VISION=0
+			shift
+			;;
+		--)
+			shift
+			EXTRA_ARGS+=("$@")
+			break
+			;;
+		-h|--help)
+			sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
+			exit 0
+			;;
+		*)
+			echo "ERROR: Unknown option: $1" >&2
+			echo "Use -- to pass options directly to llama-server." >&2
+			exit 2
+			;;
+	esac
+done
+
+if ! command -v llama-server >/dev/null 2>&1; then
+	echo "ERROR: llama-server not found." >&2
+	echo "Install llama.cpp first; on macOS: brew install llama.cpp" >&2
+	exit 1
+fi
+
+if [ ! -f "$MODEL_FILE" ]; then
+	echo "ERROR: Main model not found at ${MODEL_FILE}" >&2
+	echo "Run ./get-gemma4-llama first." >&2
+	exit 1
+fi
+
+ARGS=(
+	-m "$MODEL_FILE"
+	--alias gemma4-heretical
+	--host 127.0.0.1
+	--port "$PORT"
+	--cors-origins localhost
+	--ctx-size "$CONTEXT"
+	--parallel 1
+	--gpu-layers 99
+	--flash-attn on
+	--jinja
+	--temperature 0.6
+	--top-k 64
+	--top-p 0.9
+	--min-p 0.05
+	--repeat-penalty 1.1
+)
+
+if [ "$USE_VISION" -eq 1 ]; then
+	if [ ! -f "$MMPROJ_FILE" ]; then
+		echo "ERROR: Vision projector not found at ${MMPROJ_FILE}" >&2
+		echo "Run ./get-gemma4-llama first or use --no-vision." >&2
+		exit 1
+	fi
+	ARGS+=(--mmproj "$MMPROJ_FILE")
+fi
+
+if [ "$USE_MTP" -eq 1 ]; then
+	if [ ! -f "$MTP_FILE" ]; then
+		echo "ERROR: MTP draft head not found at ${MTP_FILE}" >&2
+		echo "Run ./get-gemma4-llama first or use --no-mtp." >&2
+		exit 1
+	fi
+	ARGS+=(--model-draft "$MTP_FILE" --spec-type draft-mtp)
+fi
+
+echo "=== llama.cpp Gemma 4 server ==="
+echo "Model:    ${MODEL_FILE}"
+echo "Vision:   $([ "$USE_VISION" -eq 1 ] && echo enabled || echo disabled)"
+echo "MTP:      $([ "$USE_MTP" -eq 1 ] && echo enabled || echo disabled)"
+echo "Context:  ${CONTEXT}"
+echo "Endpoint: http://127.0.0.1:${PORT}/v1"
+echo ""
+echo "Connect with: ./chat2  (or ./chat --backend llama)"
+echo ""
+
+if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
+	exec llama-server "${ARGS[@]}" "${EXTRA_ARGS[@]}"
+else
+	exec llama-server "${ARGS[@]}"
+fi

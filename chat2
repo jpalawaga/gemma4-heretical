@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+build_dir="$repo_dir/.build"
+binary="$build_dir/chat2"
+
+mkdir -p "$build_dir"
+(
+  cd "$repo_dir"
+  go build -o "$binary" ./cmd/chat2
+)
+
+exec "$binary" "$@"
