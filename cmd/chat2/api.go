@@ -27,7 +27,115 @@ type apiClient struct {
 	whoop                      *whoopClient
 	nextHeartbeat              *time.Time
 	heartbeatSchedulingAllowed bool
+	exposeAllTools             bool
+	enabledCapabilities        map[string]bool
 	mu                         sync.Mutex
+}
+
+// toolCapability is a group of tools that stays hidden from regular turns
+// until the model asks for it with request_toolcall (or the user enables it).
+// Heartbeats always see every available tool.
+type toolCapability struct {
+	Name        string
+	Description string
+	Tools       []string
+}
+
+var toolCapabilities = []toolCapability{
+	{
+		Name:        "scheduling",
+		Description: "persistent one-off and recurring reminders, tasks, and events (schedule_item, list_scheduled_items, complete_scheduled_item)",
+		Tools:       []string{"schedule_item", "list_scheduled_items", "complete_scheduled_item"},
+	},
+	{
+		Name:        "memory-admin",
+		Description: "reviewing and reorganising saved memories by category (list_memories, update_memory, move_memory, forget_memory)",
+		Tools:       []string{"list_memories", "update_memory", "move_memory", "forget_memory"},
+	},
+	{
+		Name:        "images",
+		Description: "asking the user for a photo or image through a consent prompt (request_image)",
+		Tools:       []string{"request_image"},
+	},
+	{
+		Name:        "whoop",
+		Description: "the user's recent Whoop recovery and sleep data (get_whoop_recovery_sleep); only works once the user has connected Whoop",
+		Tools:       []string{"get_whoop_recovery_sleep"},
+	},
+}
+
+func findCapability(name string) (toolCapability, bool) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, capability := range toolCapabilities {
+		if capability.Name == name {
+			return capability, true
+		}
+	}
+	return toolCapability{}, false
+}
+
+func capabilityNames() []string {
+	names := make([]string, 0, len(toolCapabilities))
+	for _, capability := range toolCapabilities {
+		names = append(names, capability.Name)
+	}
+	return names
+}
+
+// capabilityFor returns the capability gating a tool, if any. Tools outside
+// every capability are core and always exposed.
+func capabilityFor(toolName string) (toolCapability, bool) {
+	for _, capability := range toolCapabilities {
+		for _, name := range capability.Tools {
+			if name == toolName {
+				return capability, true
+			}
+		}
+	}
+	return toolCapability{}, false
+}
+
+func (c *apiClient) capabilityEnabled(name string) bool {
+	if c.exposeAllTools {
+		return true
+	}
+	return c.enabledCapabilities[name]
+}
+
+// EnableCapability exposes a capability for the rest of the session. The
+// second result reports whether it was already enabled.
+func (c *apiClient) EnableCapability(name string) (toolCapability, bool, error) {
+	capability, ok := findCapability(name)
+	if !ok {
+		return toolCapability{}, false, fmt.Errorf("unknown capability %q; available: %s", strings.TrimSpace(name), strings.Join(capabilityNames(), ", "))
+	}
+	if c.capabilityEnabled(capability.Name) {
+		return capability, true, nil
+	}
+	if c.enabledCapabilities == nil {
+		c.enabledCapabilities = map[string]bool{}
+	}
+	c.enabledCapabilities[capability.Name] = true
+	return capability, false, nil
+}
+
+func (c *apiClient) DisableCapability(name string) (toolCapability, error) {
+	capability, ok := findCapability(name)
+	if !ok {
+		return toolCapability{}, fmt.Errorf("unknown capability %q; available: %s", strings.TrimSpace(name), strings.Join(capabilityNames(), ", "))
+	}
+	delete(c.enabledCapabilities, capability.Name)
+	return capability, nil
+}
+
+func (c *apiClient) EnabledCapabilities() []string {
+	var names []string
+	for _, capability := range toolCapabilities {
+		if c.capabilityEnabled(capability.Name) {
+			names = append(names, capability.Name)
+		}
+	}
+	return names
 }
 
 type chatRequest struct {
@@ -40,6 +148,9 @@ type chatRequest struct {
 	Stream          bool           `json:"stream,omitempty"`
 	StreamOptions   map[string]any `json:"stream_options,omitempty"`
 	ReasoningFormat string         `json:"reasoning_format,omitempty"`
+	// ChatTemplateKwargs are llama.cpp per-request template variables, used
+	// to disable thinking for private harness exchanges.
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
 }
 
 type toolSpec struct {
@@ -318,6 +429,40 @@ var tools = []toolSpec{
 	{
 		Type: "function",
 		Function: functionSpec{
+			Name:        "request_toolcall",
+			Description: "Expose a hidden group of existing tools for the rest of this session when the user's request needs it. Capabilities: " + capabilityCatalogue() + ". The tools become available on your next tool-calling round. Use request_tool instead for a capability that does not exist at all.",
+			Parameters: objectSchema(
+				map[string]any{
+					"capability": map[string]any{
+						"type":        "string",
+						"enum":        capabilityNames(),
+						"description": "The capability to expose.",
+					},
+					"reason": stringSchema("Why the current request needs these tools."),
+				},
+				[]string{"capability", "reason"},
+			),
+		},
+	},
+	{
+		Type: "function",
+		Function: functionSpec{
+			Name:        "request_tool",
+			Description: "Request a tool capability that is genuinely missing and materially blocks the user's current request. This surfaces the request to the user; it does not install, enable, authorize, or execute the proposed tool. Do not request tools already available, and use request_toolcall for hidden tool groups that already exist. After the tool result, briefly explain the request and any safe fallback in your visible response.",
+			Parameters: objectSchema(
+				map[string]any{
+					"name":        stringSchema("A concise proposed snake_case name for the missing tool, such as create_calendar_event."),
+					"description": stringSchema("A self-contained description of what the proposed tool should do."),
+					"reason":      stringSchema("Why the missing capability is needed for the user's current request."),
+					"inputs":      stringSchema("Optional concise description of the inputs the proposed tool would need."),
+				},
+				[]string{"name", "description", "reason"},
+			),
+		},
+	},
+	{
+		Type: "function",
+		Function: functionSpec{
 			Name:        "request_image",
 			Description: "Ask the user to provide a current image when visual information is genuinely needed. This pauses the conversation and presents a consent-based camera or file-picker prompt. Never claim an image was provided until the tool result confirms it.",
 			Parameters: objectSchema(
@@ -333,11 +478,15 @@ var tools = []toolSpec{
 		Type: "function",
 		Function: functionSpec{
 			Name:        "schedule_item",
-			Description: "Schedule a one-off or recurring task, reminder, or event beginning at a specific local date and time. Use an explicit RFC3339 timestamp or YYYY-MM-DD HH:MM value; call get_current_time first when the current date or timezone is uncertain. For recurrence, provide both recurrence_unit and recurrence_period. The harness persists the series and materializes it as individual schedule items through the next 24 hours plus one later occurrence. Omit both recurrence fields for a one-off item.",
+			Description: "Schedule a one-off or recurring task, reminder, or event beginning at a specific local date and time. Supply the complete year, date, and time as RFC3339 or YYYY-MM-DD HH:MM; call get_current_time first when any part is uncertain. Past times are rejected unless allow_past is explicitly true, which is only for an intentionally overdue or backdated item. For recurrence, provide both recurrence_unit and recurrence_period. The harness persists the series and materializes it as individual schedule items through the next 24 hours plus one later occurrence. Omit both recurrence fields for a one-off item.",
 			Parameters: objectSchema(
 				map[string]any{
-					"time":  stringSchema("When the item becomes due, as RFC3339 or local YYYY-MM-DD HH:MM."),
+					"time":  stringSchema("When the item becomes due, including its year, as RFC3339 or local YYYY-MM-DD HH:MM."),
 					"event": stringSchema("A concise, self-contained description of what should happen or be remembered."),
+					"allow_past": map[string]any{
+						"type":        "boolean",
+						"description": "Set true only when intentionally creating an already-overdue or backdated item. Omit or use false for normal future scheduling.",
+					},
 					"recurrence_unit": map[string]any{
 						"type":        "string",
 						"enum":        []string{"hour", "day", "week", "month"},
@@ -358,7 +507,7 @@ var tools = []toolSpec{
 		Type: "function",
 		Function: functionSpec{
 			Name:        "list_scheduled_items",
-			Description: "List all pending scheduled items and recently completed items, including their IDs and status.",
+			Description: "List all pending scheduled items and recently completed items, including their IDs, status, completion author, and completion comment.",
 			Parameters:  objectSchema(nil, nil),
 		},
 	},
@@ -366,7 +515,7 @@ var tools = []toolSpec{
 		Type: "function",
 		Function: functionSpec{
 			Name:        "complete_scheduled_item",
-			Description: "Mark a scheduled item complete while retaining it in recent schedule history.",
+			Description: "Mark a scheduled item complete with the user's completion comment while retaining it in recent schedule history. Copy the user's supplied comment faithfully; do not invent one.",
 			Parameters: objectSchema(
 				map[string]any{
 					"id": map[string]any{
@@ -374,8 +523,9 @@ var tools = []toolSpec{
 						"minimum":     1,
 						"description": "The scheduled item ID returned by schedule_item or list_scheduled_items.",
 					},
+					"comment": stringSchema("The user's required comment about completing this item."),
 				},
-				[]string{"id"},
+				[]string{"id", "comment"},
 			),
 		},
 	},
@@ -383,7 +533,7 @@ var tools = []toolSpec{
 		Type: "function",
 		Function: functionSpec{
 			Name:        "get_current_time",
-			Description: "Returns the current local date and time.",
+			Description: "Returns the exact current local year, date, time, and timezone. Call this before scheduling whenever any part of the intended timestamp is uncertain.",
 			Parameters:  objectSchema(nil, nil),
 		},
 	},
@@ -402,17 +552,24 @@ var tools = []toolSpec{
 		Type: "function",
 		Function: functionSpec{
 			Name:        "save_memory",
-			Description: "Save something worth remembering for future conversations.",
+			Description: "Save something worth remembering for future conversations, filed under one memory category.",
 			Parameters: objectSchema(
 				map[string]any{
-					"content": stringSchema("A clear, self-contained statement to remember."),
-					"tags": map[string]any{
-						"type":        "array",
-						"items":       map[string]any{"type": "string"},
-						"description": "Optional topic tags.",
-					},
+					"content":  stringSchema("A clear, self-contained statement to remember."),
+					"category": stringSchema("The memory category to file this under. When categories are configured, use one of them exactly."),
 				},
-				[]string{"content"},
+				[]string{"content", "category"},
+			),
+		},
+	},
+	{
+		Type: "function",
+		Function: functionSpec{
+			Name:        "list_memories",
+			Description: "List every memory in one category, or omit the category to see all categories with their entry counts.",
+			Parameters: objectSchema(
+				map[string]any{"category": stringSchema("Category to list. Omit for a summary of all categories.")},
+				nil,
 			),
 		},
 	},
@@ -420,9 +577,12 @@ var tools = []toolSpec{
 		Type: "function",
 		Function: functionSpec{
 			Name:        "search_memories",
-			Description: "Search previously saved memories by keyword.",
+			Description: "Search previously saved memories by keyword, optionally within one category.",
 			Parameters: objectSchema(
-				map[string]any{"query": stringSchema("Keyword or phrase to search for.")},
+				map[string]any{
+					"query":    stringSchema("Keyword or phrase to search for."),
+					"category": stringSchema("Optional category to search within."),
+				},
 				[]string{"query"},
 			),
 		},
@@ -430,11 +590,29 @@ var tools = []toolSpec{
 	{
 		Type: "function",
 		Function: functionSpec{
-			Name:        "search_memories_by_tag",
-			Description: "Search memories by exact tag match.",
+			Name:        "update_memory",
+			Description: "Rewrite the content of one existing memory, found by keyword, optionally moving it to another category. The keyword must match exactly one memory.",
 			Parameters: objectSchema(
-				map[string]any{"tag": stringSchema("Exact tag to look up.")},
-				[]string{"tag"},
+				map[string]any{
+					"query":    stringSchema("Keyword identifying the single memory to update."),
+					"content":  stringSchema("The complete new statement that replaces the old content."),
+					"category": stringSchema("Optional new category for the memory."),
+				},
+				[]string{"query", "content"},
+			),
+		},
+	},
+	{
+		Type: "function",
+		Function: functionSpec{
+			Name:        "move_memory",
+			Description: "Re-file memories matching a keyword into a different category.",
+			Parameters: objectSchema(
+				map[string]any{
+					"query":    stringSchema("Keyword identifying the memories to move."),
+					"category": stringSchema("The category to move them into."),
+				},
+				[]string{"query", "category"},
 			),
 		},
 	},
@@ -442,13 +620,24 @@ var tools = []toolSpec{
 		Type: "function",
 		Function: functionSpec{
 			Name:        "forget_memory",
-			Description: "Remove memories matching a keyword.",
+			Description: "Remove memories matching a keyword, optionally within one category.",
 			Parameters: objectSchema(
-				map[string]any{"query": stringSchema("Keyword identifying memories to remove.")},
+				map[string]any{
+					"query":    stringSchema("Keyword identifying memories to remove."),
+					"category": stringSchema("Optional category to limit the removal to."),
+				},
 				[]string{"query"},
 			),
 		},
 	},
+}
+
+func capabilityCatalogue() string {
+	parts := make([]string, 0, len(toolCapabilities))
+	for _, capability := range toolCapabilities {
+		parts = append(parts, capability.Name+" = "+capability.Description)
+	}
+	return strings.Join(parts, "; ")
 }
 
 func parseImageRequest(call toolCall) (*imageRequest, error) {
@@ -517,6 +706,48 @@ func (c *apiClient) runTool(call toolCall) (string, string) {
 			return "Could not retrieve Whoop data: " + err.Error(), ""
 		}
 		return encodeToolResult(result), fmt.Sprintf("retrieved %d day(s) of Whoop data", days)
+	case "request_toolcall":
+		reason := strings.TrimSpace(stringArg("reason"))
+		if reason == "" {
+			return "Could not expose tools: reason is required.", ""
+		}
+		capability, already, err := c.EnableCapability(stringArg("capability"))
+		if err != nil {
+			return "Could not expose tools: " + err.Error(), ""
+		}
+		status := "enabled"
+		if already {
+			status = "already_enabled"
+		}
+		result := encodeToolResult(map[string]any{
+			"status":     status,
+			"capability": capability.Name,
+			"tools":      capability.Tools,
+			"note":       "These tools are available from your next tool-calling round for the rest of this session.",
+		})
+		if already {
+			return result, ""
+		}
+		return result, "enabled capability " + capability.Name
+	case "request_tool":
+		name := strings.TrimSpace(stringArg("name"))
+		description := strings.TrimSpace(stringArg("description"))
+		reason := strings.TrimSpace(stringArg("reason"))
+		inputs := strings.TrimSpace(stringArg("inputs"))
+		if name == "" || description == "" || reason == "" {
+			return "Could not request tool: name, description, and reason are required.", ""
+		}
+		request := map[string]any{
+			"status":      "requested",
+			"name":        name,
+			"description": description,
+			"reason":      reason,
+			"effect":      "The request was surfaced to the user. No tool was installed, enabled, authorized, or executed.",
+		}
+		if inputs != "" {
+			request["inputs"] = inputs
+		}
+		return encodeToolResult(request), "tool requested: " + name
 	case "get_current_time":
 		return time.Now().Format("2006-01-02 15:04:05 MST"), ""
 	case "schedule_next_heartbeat":
@@ -537,6 +768,14 @@ func (c *apiClient) runTool(call toolCall) (string, string) {
 		when, err := parseScheduleTime(stringArg("time"), now.Location())
 		if err != nil {
 			return "Could not schedule item: " + err.Error(), ""
+		}
+		allowPast, _ := args["allow_past"].(bool)
+		if when.Before(now.Truncate(time.Minute)) && !allowPast {
+			return fmt.Sprintf(
+				"Could not schedule item: %s is in the past relative to %s. Only retry with allow_past=true if the user explicitly intends an overdue or backdated item.",
+				when.Format(time.RFC3339),
+				now.Format(time.RFC3339),
+			), ""
 		}
 		unit := strings.ToLower(strings.TrimSpace(stringArg("recurrence_unit")))
 		_, hasPeriod := args["recurrence_period"]
@@ -583,25 +822,43 @@ func (c *apiClient) runTool(call toolCall) (string, string) {
 		if err != nil {
 			return "Could not complete scheduled item: " + err.Error(), ""
 		}
+		comment := strings.TrimSpace(stringArg("comment"))
+		if comment == "" {
+			return "Could not complete scheduled item: completion comment is required", ""
+		}
 		now := time.Now()
-		entry, err := c.schedule.Complete(id, now)
+		entry, err := c.schedule.Complete(id, comment, "agent", now)
 		if err != nil {
 			return "Could not complete scheduled item: " + err.Error(), ""
 		}
 		return encodeToolResult(scheduleView(entry, now)), fmt.Sprintf("completed scheduled item #%d", entry.ID)
 	case "save_memory":
-		tags := stringSlice(args["tags"])
-		entry, err := c.memory.Save(stringArg("content"), tags)
+		entry, err := c.memory.Save(stringArg("content"), stringArg("category"))
 		if err != nil {
 			return "Could not save memory: " + err.Error(), ""
 		}
-		return "Saved: " + entry.Content, "memory saved"
+		return "Saved in " + entry.Category + ": " + entry.Content, "memory saved"
+	case "list_memories":
+		return c.memory.List(stringArg("category")), ""
 	case "search_memories":
-		return c.memory.Search(stringArg("query")), ""
-	case "search_memories_by_tag":
-		return c.memory.SearchTag(stringArg("tag")), ""
+		return c.memory.Search(stringArg("query"), stringArg("category")), ""
+	case "update_memory":
+		entry, err := c.memory.Update(stringArg("query"), stringArg("content"), stringArg("category"))
+		if err != nil {
+			return "Could not update memory: " + err.Error(), ""
+		}
+		return "Updated in " + entry.Category + ": " + entry.Content, "memory updated"
+	case "move_memory":
+		count, category, err := c.memory.Move(stringArg("query"), stringArg("category"))
+		if err != nil {
+			return "Could not move memory: " + err.Error(), ""
+		}
+		if count == 0 {
+			return "No memories matching '" + strings.TrimSpace(stringArg("query")) + "' needed moving.", ""
+		}
+		return fmt.Sprintf("Moved %d memory entry(s) to %s.", count, category), "memory updated"
 	case "forget_memory":
-		count, err := c.memory.Forget(stringArg("query"))
+		count, err := c.memory.Forget(stringArg("query"), stringArg("category"))
 		if err != nil {
 			return "Could not forget memory: " + err.Error(), ""
 		}
@@ -640,24 +897,23 @@ func positiveIntArg(arguments map[string]any, name string) (int, error) {
 	return int(value), nil
 }
 
+// decodeToolArguments parses a tool call's JSON arguments strictly.
+func decodeToolArguments(arguments string, target any) error {
+	decoder := json.NewDecoder(strings.NewReader(arguments))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("arguments must contain one JSON object")
+	}
+	return nil
+}
+
 func encodeToolResult(value any) string {
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return `{"error":"could not encode tool result"}`
 	}
 	return string(encoded)
-}
-
-func stringSlice(value any) []string {
-	values, ok := value.([]any)
-	if !ok {
-		return nil
-	}
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		if text, ok := value.(string); ok {
-			result = append(result, text)
-		}
-	}
-	return result
 }

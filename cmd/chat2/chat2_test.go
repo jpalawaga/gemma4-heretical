@@ -63,21 +63,101 @@ func TestImageParts(t *testing.T) {
 func TestMemoryStoreRoundTrip(t *testing.T) {
 	t.Parallel()
 	store := testMemoryStore(t)
-	if _, err := store.Save("prefers dark themes", []string{"preferences", "ui"}); err != nil {
+	saved, err := store.Save("prefers dark themes", "preferences")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if result := store.Search("dark"); !strings.Contains(result, "prefers dark themes") {
+	if saved.Timestamp == "" {
+		t.Fatal("saved memory omitted its persisted bookkeeping timestamp")
+	}
+	if result := store.Search("dark", ""); !strings.Contains(result, "prefers dark themes") {
 		t.Fatalf("search missed memory: %q", result)
+	} else if strings.Contains(result, saved.Timestamp) {
+		t.Fatalf("search exposed the memory storage timestamp to the agent: %q", result)
 	}
-	if result := store.SearchTag("UI"); !strings.Contains(result, "prefers dark themes") {
-		t.Fatalf("tag search missed memory: %q", result)
+	if result := store.List("Preferences"); !strings.Contains(result, "[preferences] prefers dark themes") {
+		t.Fatalf("category list missed memory: %q", result)
+	} else if strings.Contains(result, saved.Timestamp) {
+		t.Fatalf("category list exposed the memory storage timestamp to the agent: %q", result)
 	}
-	removed, err := store.Forget("dark")
+	initial, _, _, err := store.InitialSystemMessages("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte(saved.Timestamp)) {
+		t.Fatalf("startup context exposed the memory storage timestamp: %s", encoded)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 1 || loaded[0].Timestamp != saved.Timestamp {
+		t.Fatalf("persisted memory lost its bookkeeping timestamp: %#v", loaded)
+	}
+	removed, err := store.Forget("dark", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if removed != 1 {
 		t.Fatalf("removed %d entries, want 1", removed)
+	}
+}
+
+func TestRequestToolSurfacesMissingCapabilityWithoutGrantingIt(t *testing.T) {
+	t.Parallel()
+
+	var description string
+	for _, tool := range tools {
+		if tool.Function.Name == "request_tool" {
+			description = tool.Function.Description
+			break
+		}
+	}
+	if description == "" {
+		t.Fatal("request_tool is not advertised")
+	}
+	if !strings.Contains(description, "does not install, enable, authorize, or execute") {
+		t.Fatalf("request_tool description does not define its safety boundary: %q", description)
+	}
+	if !strings.Contains(memoryToolInstructions, "request_tool") ||
+		!strings.Contains(memoryToolInstructions, "does not install, enable, authorize, or execute") {
+		t.Fatal("system guidance does not teach the model how request_tool behaves")
+	}
+
+	client := newAPIClient(modelChoice{}, 16384, testMemoryStore(t), time.Second)
+	result, notice := client.runTool(toolCall{Function: functionCall{
+		Name: "request_tool",
+		Arguments: `{
+			"name":"create_calendar_event",
+			"description":"Create an event in the user's calendar.",
+			"reason":"The user asked for an external calendar event.",
+			"inputs":"title, start time, duration"
+		}`,
+	}})
+	for _, want := range []string{
+		`"status":"requested"`,
+		`"name":"create_calendar_event"`,
+		`"inputs":"title, start time, duration"`,
+		"No tool was installed, enabled, authorized, or executed.",
+	} {
+		if !strings.Contains(result, want) {
+			t.Fatalf("request result %q does not contain %q", result, want)
+		}
+	}
+	if notice != "tool requested: create_calendar_event" {
+		t.Fatalf("notice = %q", notice)
+	}
+
+	result, notice = client.runTool(toolCall{Function: functionCall{
+		Name:      "request_tool",
+		Arguments: `{"name":"create_calendar_event"}`,
+	}})
+	if !strings.Contains(result, "name, description, and reason are required") || notice != "" {
+		t.Fatalf("invalid request result = %q, notice = %q", result, notice)
 	}
 }
 
@@ -102,7 +182,7 @@ func TestNativeScheduleStoreAndSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Complete(historical.ID, now.Add(-30*time.Minute)); err != nil {
+	if _, err := store.Complete(historical.ID, "historical completion", "tester", now.Add(-30*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -291,11 +371,12 @@ func TestScheduleToolRecurrenceArguments(t *testing.T) {
 	properties, _ := scheduleTool.Parameters["properties"].(map[string]any)
 	unitSchema, unitFound := properties["recurrence_unit"].(map[string]any)
 	periodSchema, periodFound := properties["recurrence_period"].(map[string]any)
-	if !unitFound || !periodFound || !strings.Contains(scheduleTool.Description, "provide both recurrence_unit and recurrence_period") {
+	allowPastSchema, allowPastFound := properties["allow_past"].(map[string]any)
+	if !unitFound || !periodFound || !allowPastFound || !strings.Contains(scheduleTool.Description, "provide both recurrence_unit and recurrence_period") {
 		t.Fatalf("schedule tool does not explain recurrence: %#v", scheduleTool)
 	}
-	if fmt.Sprint(unitSchema["enum"]) != "[hour day week month]" || periodSchema["minimum"] != 1 {
-		t.Fatalf("recurrence schema is not discoverable: unit=%#v period=%#v", unitSchema, periodSchema)
+	if fmt.Sprint(unitSchema["enum"]) != "[hour day week month]" || periodSchema["minimum"] != 1 || allowPastSchema["type"] != "boolean" {
+		t.Fatalf("schedule safety schema is not discoverable: unit=%#v period=%#v allow_past=%#v", unitSchema, periodSchema, allowPastSchema)
 	}
 
 	store := testMemoryStore(t)
@@ -319,12 +400,42 @@ func TestScheduleToolRecurrenceArguments(t *testing.T) {
 	}
 }
 
+func TestScheduleToolRequiresExplicitIntentForPastTimes(t *testing.T) {
+	store := testMemoryStore(t)
+	client := newAPIClient(modelChoice{Backend: backendLlama}, 16384, store, time.Second)
+	past := time.Now().AddDate(-1, 0, 0).Format(time.RFC3339)
+
+	rejected, notice := client.runTool(toolCall{Function: functionCall{
+		Name:      "schedule_item",
+		Arguments: fmt.Sprintf(`{"time":%q,"event":"unintentional wrong-year item"}`, past),
+	}})
+	if !strings.Contains(rejected, "is in the past") || !strings.Contains(rejected, "allow_past=true") || notice != "" {
+		t.Fatalf("past schedule rejection=%q notice=%q", rejected, notice)
+	}
+	entries, err := client.schedule.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("rejected past item was persisted: %#v", entries)
+	}
+
+	accepted, notice := client.runTool(toolCall{Function: functionCall{
+		Name:      "schedule_item",
+		Arguments: fmt.Sprintf(`{"time":%q,"event":"intentional overdue item","allow_past":true}`, past),
+	}})
+	if !strings.Contains(accepted, `"status":"due"`) || notice != "scheduled item #1" {
+		t.Fatalf("intentional past schedule result=%q notice=%q", accepted, notice)
+	}
+}
+
 func TestScheduleToolsAndResponseEnvelope(t *testing.T) {
 	store := testMemoryStore(t)
 	client := newAPIClient(modelChoice{Backend: backendLlama}, 16384, store, time.Second)
+	scheduledFor := time.Now().Add(time.Hour).Format(time.RFC3339)
 	result, notice := client.runTool(toolCall{Function: functionCall{
 		Name:      "schedule_item",
-		Arguments: `{"time":"2026-07-20T13:00:00-06:00","event":"scheduled through the model"}`,
+		Arguments: fmt.Sprintf(`{"time":%q,"event":"scheduled through the model"}`, scheduledFor),
 	}})
 	if !strings.Contains(result, `"id":1`) || notice != "scheduled item #1" {
 		t.Fatalf("schedule tool result=%q notice=%q", result, notice)
@@ -333,11 +444,20 @@ func TestScheduleToolsAndResponseEnvelope(t *testing.T) {
 	if !strings.Contains(listed, "scheduled through the model") {
 		t.Fatalf("list tool omitted scheduled item: %q", listed)
 	}
-	completed, notice := client.runTool(toolCall{Function: functionCall{
+	rejected, _ := client.runTool(toolCall{Function: functionCall{
 		Name:      "complete_scheduled_item",
 		Arguments: `{"id":1}`,
 	}})
-	if !strings.Contains(completed, `"status":"completed"`) || notice != "completed scheduled item #1" {
+	if !strings.Contains(rejected, "completion comment is required") {
+		t.Fatalf("completion tool accepted a missing comment: %q", rejected)
+	}
+	completed, notice := client.runTool(toolCall{Function: functionCall{
+		Name:      "complete_scheduled_item",
+		Arguments: `{"id":1,"comment":"finished through the model"}`,
+	}})
+	if !strings.Contains(completed, `"status":"completed"`) ||
+		!strings.Contains(completed, `"completion_comment":"finished through the model"`) ||
+		notice != "completed scheduled item #1" {
 		t.Fatalf("completion tool result=%q notice=%q", completed, notice)
 	}
 
@@ -360,14 +480,14 @@ func TestScheduleToolsAndResponseEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.schedule.Complete(history.ID, now.Add(-time.Hour)); err != nil {
+	if _, err := m.schedule.Complete(history.ID, "finished recently", "tester", now.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	olderHistory, err := m.schedule.Add(now.Add(-27*time.Hour), "completion outside history window", now.Add(-28*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.schedule.Complete(olderHistory.ID, now.Add(-25*time.Hour)); err != nil {
+	if _, err := m.schedule.Complete(olderHistory.ID, "finished earlier", "tester", now.Add(-25*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -384,19 +504,19 @@ func TestScheduleToolsAndResponseEnvelope(t *testing.T) {
 	if metadata.SinceLastUserMessage != "1h30m0s" || metadata.Schedule == nil {
 		t.Fatalf("unexpected envelope metadata: %#v", metadata)
 	}
-	if metadata.SentAt != "Monday July 20, 12:00 PM MDT" || metadata.Schedule.UpcomingThrough != "Tuesday July 21, 12:00 PM MDT" {
+	if metadata.SentAt != "Monday July 20, 2026 at 12:00 PM MDT" || metadata.Schedule.UpcomingThrough != "Tuesday July 21, 2026 at 12:00 PM MDT" {
 		t.Fatalf("envelope times are not human-readable: %#v", metadata)
 	}
 	if len(metadata.Schedule.Due) != 1 || len(metadata.Schedule.Upcoming) != 1 || len(metadata.Schedule.RecentlyCompleted) != 1 {
 		t.Fatalf("schedule envelope classification is wrong: %#v", metadata.Schedule)
 	}
-	if metadata.Schedule.Due[0].Time != "Monday July 20, 11:00 AM MDT" || metadata.Schedule.RecentlyCompleted[0].CompletedAt != "Monday July 20, 11:00 AM MDT" {
+	if metadata.Schedule.Due[0].Time != "Monday July 20, 2026 at 11:00 AM MDT" || metadata.Schedule.RecentlyCompleted[0].CompletedAt != "Monday July 20, 2026 at 11:00 AM MDT" {
 		t.Fatalf("scheduled item times are not human-readable: %#v", metadata.Schedule)
 	}
 	if metadata.Schedule.NextLater == nil || metadata.Schedule.NextLater.ID != later.ID {
 		t.Fatalf("next item beyond 24 hours was not injected: %#v", metadata.Schedule)
 	}
-	heartbeat := m.responseEnvelope("[HEARTBEAT | Monday July 20, 12:00 PM MDT | "+timeSinceUser(now, m.lastSent)+"]", now)
+	heartbeat := m.responseEnvelope("[HEARTBEAT | Monday July 20, 2026 at 12:00 PM MDT | "+timeSinceUser(now, m.lastSent)+"]", now)
 	if !strings.Contains(heartbeat, "1h30m0s") || !strings.Contains(heartbeat, "inject due") {
 		t.Fatalf("heartbeat did not use refreshed envelope metadata: %q", heartbeat)
 	}
@@ -703,14 +823,15 @@ func TestStructuredHeartbeatNoneIsSilentAndEphemeral(t *testing.T) {
 		if request.ToolChoice != "required" {
 			t.Errorf("tool choice = %#v, want required", request.ToolChoice)
 		}
-		if request.ReasoningFormat != "none" {
-			t.Errorf("heartbeat reasoning format = %q, want none", request.ReasoningFormat)
+		if request.ReasoningFormat != "deepseek" {
+			t.Errorf("heartbeat reasoning format = %q, want deepseek", request.ReasoningFormat)
 		}
 		last := request.Messages[len(request.Messages)-1]
 		if last.Role != "system" || !strings.HasPrefix(fmt.Sprint(last.Content), heartbeatEventPrefix) {
 			t.Errorf("heartbeat event = %#v", last)
 		}
 		writeSSE(w, map[string]any{"choices": []any{map[string]any{"delta": map[string]any{
+			"reasoning_content": "Nothing is due, so this heartbeat can remain silent.",
 			"tool_calls": []any{map[string]any{
 				"index": 0, "id": "heartbeat-none", "type": "function",
 				"function": map[string]any{"name": "complete_heartbeat", "arguments": `{"action":"none"}`},
@@ -727,8 +848,14 @@ func TestStructuredHeartbeatNoneIsSilentAndEphemeral(t *testing.T) {
 	}, 16384, testMemoryStore(t), 5*time.Second)
 	base := []apiMessage{{Role: "system", Content: "stable instructions"}, {Role: "user", Content: "hello"}, {Role: "assistant", Content: "hi"}}
 	requestMessages := append(append([]apiMessage(nil), base...), apiMessage{Role: "system", Content: heartbeatEventPrompt(`{"sent_at":"now"}`)})
-	var result completionResult
+	var (
+		result            completionResult
+		streamedReasoning string
+	)
 	for event := range client.completeStream(context.Background(), requestMessages, false) {
+		if event.Kind == streamReasoningDelta {
+			streamedReasoning += event.Delta
+		}
 		if event.Kind == streamFinished {
 			if event.Err != nil {
 				t.Fatal(event.Err)
@@ -739,10 +866,107 @@ func TestStructuredHeartbeatNoneIsSilentAndEphemeral(t *testing.T) {
 	if result.Reply != "" || result.HadVisibleReply || len(result.Messages) != len(base) {
 		t.Fatalf("silent heartbeat result = %#v", result)
 	}
+	if !strings.Contains(streamedReasoning, "Nothing is due") || result.Reasoning != streamedReasoning {
+		t.Fatalf("heartbeat reasoning was not preserved: streamed=%q result=%q", streamedReasoning, result.Reasoning)
+	}
 	for _, message := range result.Messages {
 		if strings.Contains(fmt.Sprint(message.Content), heartbeatEventPrefix) {
 			t.Fatalf("heartbeat event leaked into main history: %#v", result.Messages)
 		}
+	}
+}
+
+func TestHeartbeatPromptAuditsExplicitScheduleRequestsBeforeFinishing(t *testing.T) {
+	metadata := `{"schedule":{"completion_requests":["USER requests scheduled item #3 be marked as complete."]}}`
+	prompt := heartbeatEventPrompt(metadata)
+	for _, required := range []string{
+		"Reconcile the 'schedule' with recent chat messages",
+		"using 'list_scheduled_items' toolcalls if necessary",
+		"if something is missing from the schedule, add it with a 'schedule_item' tool call",
+		"if the user claimed to do something and it matches a recent upcoming item, mark it as done",
+		"including after silent maintenance",
+		"no response has been sent merely because you drafted one",
+		"reasoning_content",
+		`action "notify"`,
+		"entire final response in message",
+		metadata,
+	} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("heartbeat prompt omitted %q: %s", required, prompt)
+		}
+	}
+	auditAt := strings.Index(prompt, "Reconcile the 'schedule' with recent chat messages")
+	finishAt := strings.Index(prompt, "Then call complete_heartbeat")
+	if auditAt < 0 || finishAt < 0 || auditAt >= finishAt {
+		t.Fatalf("heartbeat prompt finishes before its schedule audit: %s", prompt)
+	}
+}
+
+func TestStructuredHeartbeatRetriesProseDiscardedByActionNone(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		var request chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if call == 1 {
+			writeSSE(w, map[string]any{"choices": []any{map[string]any{"delta": map[string]any{
+				"content": "This response should reach the user.",
+				"tool_calls": []any{map[string]any{
+					"index": 0, "id": "heartbeat-mistake", "type": "function",
+					"function": map[string]any{
+						"name":      "complete_heartbeat",
+						"arguments": `{"action":"none"}`,
+					},
+				}},
+			}}}})
+			return
+		}
+		foundCorrection := false
+		for _, message := range request.Messages {
+			if message.Role == "tool" && strings.Contains(fmt.Sprint(message.Content), "copy the complete intended response") {
+				foundCorrection = true
+				break
+			}
+		}
+		if !foundCorrection {
+			t.Error("retry request omitted the heartbeat visibility correction")
+		}
+		writeSSE(w, map[string]any{"choices": []any{map[string]any{"delta": map[string]any{
+			"tool_calls": []any{map[string]any{
+				"index": 0, "id": "heartbeat-notify", "type": "function",
+				"function": map[string]any{
+					"name":      "complete_heartbeat",
+					"arguments": `{"action":"notify","message":"This response should reach the user."}`,
+				},
+			}},
+		}}}})
+	}))
+	defer server.Close()
+
+	client := newAPIClient(modelChoice{
+		Backend: backendLlama,
+		Model:   "gemma4-heretical",
+		BaseURL: server.URL,
+		APIKey:  "none",
+	}, 16384, testMemoryStore(t), 5*time.Second)
+	messages := []apiMessage{
+		{Role: "user", Content: "Check whether I need an update."},
+		{Role: "system", Content: heartbeatEventPrompt(`{"sent_at":"now"}`)},
+	}
+	result, err := client.completeHeartbeatStreaming(context.Background(), messages, func(completionStreamEvent) bool {
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("heartbeat made %d calls, want correction retry", calls.Load())
+	}
+	if result.Reply != "This response should reach the user." || !result.HadVisibleReply {
+		t.Fatalf("corrected heartbeat result = %#v", result)
 	}
 }
 
@@ -926,7 +1150,7 @@ func writeSSE(w http.ResponseWriter, chunks ...any) {
 func TestStartupLoadsContextAndConfiguresLabels(t *testing.T) {
 	t.Parallel()
 	store := testMemoryStore(t)
-	if _, err := store.Save("The user likes astronomical names.", []string{"preference"}); err != nil {
+	if _, err := store.Save("The user likes astronomical names.", "preference"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.AppendRecentMessage("user", "previous question"); err != nil {
@@ -1164,6 +1388,209 @@ func TestTranscriptUsesSessionLabels(t *testing.T) {
 	}
 }
 
+func TestCompactTranscriptUsesInitialSpeakerLabelsAndPlainDenseLines(t *testing.T) {
+	t.Parallel()
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	m.width = 80
+	m.userLabel = "Stargazer"
+	m.assistantLabel = "Nova"
+	m.compactTranscript = true
+	m.transcript = []transcriptMessage{
+		{Role: "user", Content: "hello\n\nthere", OccurredAt: time.Now()},
+		{Role: "assistant", Content: "## Answer\n\nThis is **important**.\n\n- first\n- second", OccurredAt: time.Now()},
+	}
+
+	rendered := m.renderTranscript(72)
+	if !strings.HasPrefix(rendered, "S: hello there\nN:") {
+		t.Fatalf("compact labels or spacing are wrong: %q", rendered)
+	}
+	for _, unwanted := range []string{"Stargazer:", "Nova:", "##", "**", "\n\n", "\x1b", "│"} {
+		if strings.Contains(rendered, unwanted) {
+			t.Fatalf("compact transcript retained formatting %q: %q", unwanted, rendered)
+		}
+	}
+	for _, expected := range []string{"Answer", "important", "first", "second"} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("compact transcript omitted %q: %q", expected, rendered)
+		}
+	}
+}
+
+func TestCompactTranscriptWrapsLongMessagesToWidth(t *testing.T) {
+	t.Parallel()
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	m.assistantLabel = "Nova"
+	m.compactTranscript = true
+	m.transcript = []transcriptMessage{{
+		Role:    "assistant",
+		Content: "This compact response contains enough words to wrap across several visible lines.",
+	}}
+
+	const width = 24
+	rendered := m.renderTranscript(width)
+	lines := strings.Split(rendered, "\n")
+	if len(lines) < 2 {
+		t.Fatalf("compact message did not wrap: %q", rendered)
+	}
+	if !strings.HasPrefix(lines[0], "N: ") || !strings.HasPrefix(lines[1], "   ") {
+		t.Fatalf("compact message label or continuation indent is wrong: %q", rendered)
+	}
+	for _, line := range lines {
+		if len(line) > width {
+			t.Fatalf("compact line exceeds width %d: %q", width, line)
+		}
+	}
+	if !strings.Contains(strings.Join(strings.Fields(rendered), " "), "several visible lines.") {
+		t.Fatalf("wrapped compact message lost trailing content: %q", rendered)
+	}
+}
+
+func TestControlOTogglesCompactTranscript(t *testing.T) {
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	m.phase = phaseChatting
+	m.width = 80
+	m.height = 24
+	m.resize()
+	m.composer.Focus()
+
+	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Code: 'o', Mod: tea.ModCtrl}))
+	got := updated.(appModel)
+	if !got.compactTranscript || !strings.Contains(got.status, "enabled") {
+		t.Fatalf("Ctrl+O did not enable compact transcript: %#v", got)
+	}
+
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Code: 'o', Mod: tea.ModCtrl}))
+	got = updated.(appModel)
+	if got.compactTranscript || !strings.Contains(got.status, "disabled") {
+		t.Fatalf("Ctrl+O did not disable compact transcript: %#v", got)
+	}
+}
+
+func TestFirstCharacterSupportsUnicodeLabels(t *testing.T) {
+	t.Parallel()
+	if got := firstCharacter("🤖 Nova"); got != "🤖" {
+		t.Fatalf("firstCharacter returned %q", got)
+	}
+	if got := firstCharacter(""); got != "A" {
+		t.Fatalf("empty label fallback = %q", got)
+	}
+}
+
+func TestMemoryAndScheduleNoticesRenderAsTranscriptChips(t *testing.T) {
+	notices := []string{
+		"memory saved",
+		"memory updated",
+		"removed 2 memory entry(s)",
+		"scheduled item #7",
+		"scheduled recurring series #8",
+		"completed scheduled item #9",
+		"next heartbeat 2026-07-25 09:00 MDT",
+	}
+	chips, remaining := mutationNoticeChips(notices)
+	if len(chips) != 6 || len(remaining) != 1 || !strings.HasPrefix(remaining[0], "next heartbeat") {
+		t.Fatalf("notice partition = chips=%#v remaining=%#v", chips, remaining)
+	}
+
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	m.phase = phaseChatting
+	m.width = 100
+	m.height = 24
+	m.resize()
+	updated, _ := m.Update(responseMsg{result: completionResult{
+		Reply:   "Done.",
+		Notices: notices,
+	}})
+	m = updated.(appModel)
+	if len(m.transcript) != 1 || len(m.transcript[0].Chips) != len(chips) ||
+		!strings.HasPrefix(m.transcript[0].Meta, "next heartbeat") {
+		t.Fatalf("response did not attach mutation chips to its assistant turn: %#v", m.transcript)
+	}
+	rendered := m.renderTranscript(92)
+	for _, label := range []string{
+		"Memory Saved",
+		"Memory Updated",
+		"Memory Removed",
+		"Schedule Created",
+		"Schedule Complete",
+	} {
+		if !strings.Contains(rendered, label) {
+			t.Fatalf("rendered transcript omitted chip %q: %q", label, rendered)
+		}
+	}
+	if !strings.Contains(rendered, "\x1b[") {
+		t.Fatalf("normal transcript chips omitted visual styling: %q", rendered)
+	}
+	if !strings.Contains(rendered, "") || !strings.Contains(rendered, "") {
+		t.Fatalf("normal transcript chips omitted Powerline caps: %q", rendered)
+	}
+
+	m.compactTranscript = true
+	compact := m.renderTranscript(92)
+	if strings.Contains(compact, "\x1b[") || !strings.Contains(compact, "[Memory Saved]") {
+		t.Fatalf("compact transcript chip fallback is wrong: %q", compact)
+	}
+}
+
+func TestSubmitKeepsResponseEnvelopeOutOfDebugTranscript(t *testing.T) {
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	m.phase = phaseChatting
+	m.showDebug = true
+	m.transcript = []transcriptMessage{{
+		Role:  "notice",
+		Chips: []transcriptChip{{Kind: "memory", Label: "Memory Saved"}},
+	}}
+
+	_ = m.submit("what changed?")
+
+	if len(m.messages) < 2 {
+		t.Fatal("submission did not add metadata and user messages")
+	}
+	metadataMessage := m.messages[len(m.messages)-2]
+	metadataContent, ok := metadataMessage.Content.(string)
+	if metadataMessage.Role != "system" || !ok ||
+		!strings.Contains(metadataContent, "private harness context") ||
+		!strings.Contains(metadataContent, `"sent_at"`) {
+		t.Fatalf("model request omitted its private metadata context: %#v", m.messages)
+	}
+	userMessage := m.messages[len(m.messages)-1]
+	if userMessage.Role != "user" || userMessage.Content != "what changed?" {
+		t.Fatalf("user content was not kept separate from metadata: %#v", userMessage)
+	}
+	if strings.Contains(metadataContent, "[HARNESS METADATA]") {
+		t.Fatalf("legacy metadata envelope marker remained in a regular turn: %q", metadataContent)
+	}
+	rendered := m.renderTranscript(72)
+	if strings.Contains(rendered, "HARNESS METADATA") || strings.Contains(rendered, "response envelope") {
+		t.Fatalf("private response envelope leaked into debug transcript: %q", rendered)
+	}
+	if !strings.Contains(rendered, "Memory Saved") || !strings.Contains(rendered, "what changed?") {
+		t.Fatalf("visible update or user turn was lost: %q", rendered)
+	}
+}
+
+func TestSilentHeartbeatMutationRendersStandaloneChip(t *testing.T) {
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	m.phase = phaseChatting
+	m.width = 80
+	m.height = 24
+	m.resize()
+
+	updated, _ := m.Update(responseMsg{
+		heartbeat: true,
+		result: completionResult{
+			Notices: []string{"completed scheduled item #4"},
+		},
+	})
+	got := updated.(appModel)
+	if len(got.transcript) != 1 || got.transcript[0].Role != "notice" ||
+		len(got.transcript[0].Chips) != 1 {
+		t.Fatalf("silent heartbeat mutation did not create a standalone chip: %#v", got.transcript)
+	}
+	if rendered := got.renderTranscript(72); !strings.Contains(rendered, "Schedule Complete") {
+		t.Fatalf("standalone heartbeat chip was not visible: %q", rendered)
+	}
+}
+
 func TestTranscriptHidesSystemMessagesUnlessDebugging(t *testing.T) {
 	t.Parallel()
 	m := newAppModel(appConfig{}, testMemoryStore(t))
@@ -1268,6 +1695,97 @@ func TestCompletionStreamUpdatesTUIIncrementally(t *testing.T) {
 	}
 }
 
+func TestComposerRemainsResponsiveWhileAgentIsBusy(t *testing.T) {
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	m.phase = phaseChatting
+	m.width = 80
+	m.height = 24
+	m.resize()
+	m.composer.Focus()
+	m.busy = true
+	m.status = "Heartbeat…"
+
+	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Text: "j", Code: 'j'}))
+	got := updated.(appModel)
+	if got.composer.Value() != "j" {
+		t.Fatalf("busy composer dropped typed text: %q", got.composer.Value())
+	}
+
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter, Mod: tea.ModShift}))
+	got = updated.(appModel)
+	if got.composer.Value() != "j\n" {
+		t.Fatalf("busy composer dropped Shift+Enter newline: %q", got.composer.Value())
+	}
+
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Code: 'j', Mod: tea.ModCtrl}))
+	got = updated.(appModel)
+	if got.composer.Value() != "j\n\n" {
+		t.Fatalf("busy composer dropped Ctrl+J fallback newline: %q", got.composer.Value())
+	}
+
+	updated, cmd := got.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	got = updated.(appModel)
+	if cmd != nil {
+		t.Fatal("busy Enter started a second model turn")
+	}
+	if got.composer.Value() != "j\n\n" {
+		t.Fatalf("busy Enter cleared the saved draft: %q", got.composer.Value())
+	}
+	if !strings.Contains(got.status, "Draft saved") {
+		t.Fatalf("busy Enter did not explain deferred sending: %q", got.status)
+	}
+	if !strings.Contains(got.renderChat(), "keep drafting") {
+		t.Fatal("busy chat footer does not advertise drafting behavior")
+	}
+}
+
+func TestStreamingDoesNotUndoManualTranscriptScroll(t *testing.T) {
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	m.phase = phaseChatting
+	m.width = 80
+	m.height = 24
+	m.resize()
+	m.transcript = []transcriptMessage{{
+		Role:    "assistant",
+		Content: strings.Repeat("history line\n", 60),
+	}}
+	m.refreshTranscript()
+	m.viewport.GotoBottom()
+	m.viewport.PageUp()
+	wantOffset := m.viewport.YOffset()
+	if m.viewport.AtBottom() {
+		t.Fatal("test viewport did not move away from the bottom")
+	}
+	m.busy = true
+	m.streamSession = 7
+	m.streamEvents = make(chan completionStreamEvent)
+
+	updated, _ := m.Update(completionStreamMsg{
+		session: 7,
+		events:  m.streamEvents,
+		event:   completionStreamEvent{Kind: streamContentDelta, Delta: "new streaming text"},
+		ok:      true,
+	})
+	got := updated.(appModel)
+	if got.viewport.YOffset() != wantOffset {
+		t.Fatalf("stream moved manually scrolled transcript from %d to %d", wantOffset, got.viewport.YOffset())
+	}
+
+	updated, _ = got.Update(completionStreamMsg{
+		session: 7,
+		events:  got.streamEvents,
+		event: completionStreamEvent{Kind: streamFinished, Result: completionResult{
+			Reply:    "new streaming text",
+			Messages: []apiMessage{{Role: "user", Content: "question"}},
+		}},
+		ok: true,
+	})
+	got = updated.(appModel)
+	if got.viewport.YOffset() != wantOffset {
+		t.Fatalf("stream completion moved manually scrolled transcript from %d to %d", wantOffset, got.viewport.YOffset())
+	}
+}
+
 func TestSilentStructuredHeartbeatRearmsWithoutChangingHistory(t *testing.T) {
 	m := newAppModel(appConfig{Heartbeat: defaultHeartbeatInterval}, testMemoryStore(t))
 	m.phase = phaseChatting
@@ -1296,6 +1814,43 @@ func TestSilentStructuredHeartbeatRearmsWithoutChangingHistory(t *testing.T) {
 	}
 	if len(m.messages) != len(base) || len(m.transcript) != 0 {
 		t.Fatalf("silent heartbeat changed main history: messages=%#v transcript=%#v", m.messages, m.transcript)
+	}
+}
+
+func TestSilentHeartbeatReasoningIsVisibleOnlyInDebugTranscript(t *testing.T) {
+	m := newAppModel(appConfig{Heartbeat: defaultHeartbeatInterval}, testMemoryStore(t))
+	m.phase = phaseChatting
+	m.width = 80
+	m.height = 30
+	m.resize()
+	m.busy = true
+	m.streamSession = 9
+	m.streamEvents = make(chan completionStreamEvent)
+	m.streamHeartbeat = true
+	reasoning := "I checked the schedule and found nothing due."
+
+	updated, _ := m.Update(completionStreamMsg{
+		session: 9,
+		events:  m.streamEvents,
+		event: completionStreamEvent{
+			Kind: streamFinished,
+			Result: completionResult{
+				Reasoning:    reasoning,
+				HadToolCalls: true,
+			},
+		},
+		ok: true,
+	})
+	m = updated.(appModel)
+	if len(m.transcript) != 1 || m.transcript[0].Role != "reasoning" || m.transcript[0].Meta != "heartbeat" {
+		t.Fatalf("heartbeat reasoning was not retained as debug transcript: %#v", m.transcript)
+	}
+	if rendered := m.renderTranscript(72); strings.Contains(rendered, reasoning) {
+		t.Fatalf("heartbeat reasoning leaked outside debug mode: %q", rendered)
+	}
+	m.showDebug = true
+	if rendered := m.renderTranscript(72); !strings.Contains(rendered, reasoning) {
+		t.Fatalf("debug transcript omitted heartbeat reasoning: %q", rendered)
 	}
 }
 
@@ -1491,6 +2046,22 @@ func TestCapturePhotoWindowReturnsBrowserJPEG(t *testing.T) {
 	}
 }
 
+func TestCameraWindowIncludesThreeSecondTimer(t *testing.T) {
+	t.Parallel()
+	for _, required := range []string{
+		`id="timer"`,
+		`3s Timer`,
+		`id="countdown"`,
+		`async function timedCapture()`,
+		`for(let remaining=3;remaining>=1;remaining--)`,
+		`timer.onclick=timedCapture`,
+	} {
+		if !strings.Contains(cameraWindowHTML, required) {
+			t.Fatalf("camera page omitted timer behavior %q", required)
+		}
+	}
+}
+
 func TestBrowserBundleIDFromLaunchServices(t *testing.T) {
 	t.Parallel()
 	preferences := `(
@@ -1610,6 +2181,454 @@ func TestManualCameraCaptureIsDeletedWhenQueuedMessageIsSent(t *testing.T) {
 	m.stopCompletionStream()
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("queued camera capture still exists after encoding: %v", err)
+	}
+}
+
+func TestManualCapturesShowAggregateQueueCount(t *testing.T) {
+	m := newAppModel(appConfig{RequestTimeout: time.Second}, testMemoryStore(t))
+	m.phase = phasePhotoReview
+	m.width = 100
+	m.height = 30
+	m.resize()
+
+	for index := range 2 {
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("photo-%d.png", index+1))
+		if err := os.WriteFile(path, []byte("\x89PNG\r\n\x1a\nphoto"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		m.captureManual = true
+		m.imageRequest = &imageRequest{Prompt: "Take a photo", Reason: "Manual capture"}
+		if cmd := m.finishImageRequest(path, false); cmd == nil {
+			t.Fatal("manual approval did not restore composer focus")
+		}
+	}
+
+	if len(m.pendingImages) != 2 {
+		t.Fatalf("queued %d images, want 2", len(m.pendingImages))
+	}
+	if !strings.Contains(m.status, "2 images queued") {
+		t.Fatalf("aggregate count missing from status: %q", m.status)
+	}
+	if !strings.Contains(m.renderChat(), "2 images queued") {
+		t.Fatal("aggregate count missing from the main chat controls")
+	}
+	if got := m.transcript[len(m.transcript)-1].Content; !strings.Contains(got, "2 images queued") {
+		t.Fatalf("aggregate count missing from capture transcript: %q", got)
+	}
+}
+
+func TestBrowserCaptureQueuesImmediatelyWithoutPhotoReview(t *testing.T) {
+	m := newAppModel(appConfig{RequestTimeout: time.Second}, testMemoryStore(t))
+	path, err := m.captureVault.SealJPEG(t.TempDir(), testJPEG(t, 12, 8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.phase = phaseCameraWindow
+	m.windowSession = 7
+	m.captureManual = true
+	m.imageRequest = &imageRequest{Prompt: "Take a photo", Reason: "Manual capture"}
+
+	updated, _ := m.Update(cameraWindowResultMsg{session: 7, path: path})
+	got := updated.(appModel)
+	if got.phase != phaseChatting {
+		t.Fatalf("browser capture entered phase %v, want chatting", got.phase)
+	}
+	if len(got.pendingImages) != 1 || got.pendingImages[0] != path {
+		t.Fatalf("browser capture was not queued immediately: %#v", got.pendingImages)
+	}
+}
+
+func TestBrowserCaptureForModelContinuesWithoutPhotoReview(t *testing.T) {
+	m := newAppModel(appConfig{RequestTimeout: time.Second}, testMemoryStore(t))
+	path, err := m.captureVault.SealJPEG(t.TempDir(), testJPEG(t, 12, 8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.phase = phaseCameraWindow
+	m.windowSession = 9
+	m.captureOwned = false
+	m.imageRequest = &imageRequest{ToolCallID: "image-1", Prompt: "Show the label", Reason: "Read it"}
+	m.messages = []apiMessage{{Role: "assistant", ToolCalls: []toolCall{{ID: "image-1"}}}}
+
+	updated, cmd := m.Update(cameraWindowResultMsg{session: 9, path: path})
+	got := updated.(appModel)
+	got.stopCompletionStream()
+	if cmd == nil || got.phase != phaseChatting || !got.busy {
+		t.Fatalf("browser capture did not continue the model immediately: phase=%v busy=%t cmd=%v", got.phase, got.busy, cmd)
+	}
+	if len(got.messages) != 3 || got.messages[1].Role != "tool" || got.messages[2].Role != "user" {
+		t.Fatalf("model continuation messages = %#v", got.messages)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("encrypted browser capture survived after encoding: %v", err)
+	}
+}
+
+func TestControlIOpensImageManagerAndRemovalDeletesOwnedCapture(t *testing.T) {
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	path, err := m.captureVault.SealJPEG(t.TempDir(), testJPEG(t, 12, 8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.phase = phaseChatting
+	m.pendingImages = []string{path}
+	m.composer.Focus()
+
+	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Code: 'i', Mod: tea.ModCtrl}))
+	got := updated.(appModel)
+	if got.phase != phaseImageManager || got.composer.Focused() {
+		t.Fatalf("Ctrl+I did not open the image manager: phase=%v focused=%t", got.phase, got.composer.Focused())
+	}
+	if !strings.Contains(got.renderImageManager(), "1 image queued") {
+		t.Fatal("image manager omitted the queue count")
+	}
+
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Text: "d", Code: 'd'}))
+	got = updated.(appModel)
+	if len(got.pendingImages) != 0 {
+		t.Fatalf("removed image remained queued: %#v", got.pendingImages)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("removed encrypted capture remained on disk: %v", err)
+	}
+}
+
+func TestControlSCompletesScheduleItemAndQueuesAgentMetadata(t *testing.T) {
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	now := time.Now()
+	entry, err := m.schedule.Add(now.Add(-time.Hour), "finish the schedule manager", now.Add(-2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.phase = phaseChatting
+	m.width = 100
+	m.height = 30
+	m.resize()
+	m.composer.Focus()
+
+	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Code: 's', Mod: tea.ModCtrl}))
+	got := updated.(appModel)
+	if got.phase != phaseScheduleManager || got.composer.Focused() {
+		t.Fatalf("Ctrl+S did not open the schedule manager: phase=%v focused=%t", got.phase, got.composer.Focused())
+	}
+	if len(got.scheduleManagerEntries) != 1 || !strings.Contains(got.renderScheduleManager(), entry.Event) {
+		t.Fatalf("schedule manager did not list the item: %#v", got.scheduleManagerEntries)
+	}
+
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Text: "c", Code: 'c'}))
+	got = updated.(appModel)
+	if len(got.scheduleManagerSelected) != 1 || len(got.pendingScheduleCompletions) != 0 {
+		t.Fatalf("item was not staged for the exit dialog: selected=%#v pending=%#v", got.scheduleManagerSelected, got.pendingScheduleCompletions)
+	}
+	persisted, err := got.schedule.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != 1 || persisted[0].CompletedAt != nil {
+		t.Fatalf("selecting the item completed it before confirmation: %#v", persisted)
+	}
+
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Code: 's', Mod: tea.ModCtrl}))
+	got = updated.(appModel)
+	if got.phase != phaseScheduleAction || !strings.Contains(got.renderScheduleAction(), "Mark the selected items done now") {
+		t.Fatalf("schedule exit did not open its action dialog: phase=%v", got.phase)
+	}
+
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	got = updated.(appModel)
+	if got.phase != phaseScheduleAction || !strings.Contains(got.status, "comment is required") {
+		t.Fatalf("empty completion comment was accepted: phase=%v status=%q", got.phase, got.status)
+	}
+
+	got.scheduleComment.SetValue("finished the manager flow")
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	got = updated.(appModel)
+	if got.phase != phaseChatting || got.busy || len(got.pendingScheduleCompletions) != 1 || len(got.messages) != 0 {
+		t.Fatalf("confirmed completion did not remain queued for a later turn: phase=%v busy=%t pending=%#v messages=%#v", got.phase, got.busy, got.pendingScheduleCompletions, got.messages)
+	}
+	persisted, err = got.schedule.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != 1 || persisted[0].CompletedAt == nil ||
+		persisted[0].CompletionComment != "finished the manager flow" ||
+		persisted[0].CompletedBy != "USER" {
+		t.Fatalf("completion was not persisted: %#v", persisted)
+	}
+	if len(got.transcript) != 1 ||
+		len(got.transcript[0].Chips) != 1 ||
+		got.transcript[0].Chips[0].Label != "Schedule Complete" {
+		t.Fatalf("local schedule completion did not render its update chip: %#v", got.transcript)
+	}
+	if rendered := got.renderChat(); strings.Contains(rendered, "queued for agent") {
+		t.Fatalf("chat exposed a visual schedule queue: %q", rendered)
+	}
+
+	enveloped := got.responseEnvelope("what changed?", now.Add(time.Minute))
+	metadataJSON := strings.TrimPrefix(enveloped, "[HARNESS METADATA]\n")
+	metadataJSON, _, _ = strings.Cut(metadataJSON, "\n[/HARNESS METADATA]")
+	var metadata responseEnvelopeMetadata
+	if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Schedule == nil || len(metadata.Schedule.RecentlyCompleted) != 1 ||
+		metadata.Schedule.RecentlyCompleted[0].ID != entry.ID ||
+		metadata.Schedule.RecentlyCompleted[0].CompletionComment != "finished the manager flow" ||
+		metadata.Schedule.RecentlyCompleted[0].CompletedBy != "USER" {
+		t.Fatalf("queued completion metadata omitted its comment or author: %#v", metadata.Schedule)
+	}
+	if len(got.pendingScheduleCompletions) != 0 {
+		t.Fatalf("delivered completion remained queued: %#v", got.pendingScheduleCompletions)
+	}
+
+	second := got.responseEnvelope("anything else?", now.Add(2*time.Minute))
+	if strings.Contains(second, `"recently_completed"`) {
+		t.Fatalf("completion was attached more than once: %s", second)
+	}
+}
+
+func TestScheduleExitCanRequestAgentCompletion(t *testing.T) {
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	m.userLabel = "Stargazer"
+	now := time.Now()
+	entry, err := m.schedule.Add(now.Add(-time.Hour), "agent-completed task", now.Add(-2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.phase = phaseChatting
+	m.openScheduleManager(now)
+
+	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Text: "c", Code: 'c'}))
+	got := updated.(appModel)
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Code: 's', Mod: tea.ModCtrl}))
+	got = updated.(appModel)
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+	got = updated.(appModel)
+	got.scheduleComment.SetValue("wrapped up the agent task")
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	got = updated.(appModel)
+
+	if got.phase != phaseChatting || got.busy || len(got.pendingScheduleRequests) != 1 || len(got.messages) != 0 {
+		t.Fatalf("agent completion request did not remain queued for a later turn: phase=%v busy=%t pending=%#v messages=%#v", got.phase, got.busy, got.pendingScheduleRequests, got.messages)
+	}
+	persisted, err := got.schedule.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != 1 || persisted[0].CompletedAt != nil {
+		t.Fatalf("request path completed the item locally: %#v", persisted)
+	}
+
+	enveloped := got.responseEnvelope("next input", now.Add(time.Minute))
+	metadataJSON := strings.TrimPrefix(enveloped, "[HARNESS METADATA]\n")
+	metadataJSON, _, _ = strings.Cut(metadataJSON, "\n[/HARNESS METADATA]")
+	var metadata responseEnvelopeMetadata
+	if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Schedule == nil || len(metadata.Schedule.CompletionRequests) != 1 {
+		t.Fatalf("completion request was not attached to metadata: %#v", metadata.Schedule)
+	}
+	requestMetadata := metadata.Schedule.CompletionRequests[0]
+	for _, required := range []string{
+		`Stargazer requests scheduled item #1`,
+		entry.Event,
+		`wrapped up the agent task`,
+	} {
+		if !strings.Contains(requestMetadata, required) {
+			t.Fatalf("completion request metadata omitted %q: %s", required, requestMetadata)
+		}
+	}
+	if len(got.pendingScheduleRequests) != 0 {
+		t.Fatalf("attached completion request remained pending: %#v", got.pendingScheduleRequests)
+	}
+
+	got.openScheduleManager(now.Add(2 * time.Minute))
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Text: "c", Code: 'c'}))
+	got = updated.(appModel)
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Code: 's', Mod: tea.ModCtrl}))
+	got = updated.(appModel)
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+	got = updated.(appModel)
+	got.scheduleComment.SetValue("second completion attempt")
+	updated, _ = got.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	got = updated.(appModel)
+	if got.busy || len(got.messages) != 0 || len(got.pendingScheduleRequests) != 1 {
+		t.Fatalf("repeated request triggered a turn or was not queued: busy=%t messages=%#v pending=%#v", got.busy, got.messages, got.pendingScheduleRequests)
+	}
+	secondEnvelope := got.responseEnvelope("later input", now.Add(3*time.Minute))
+	secondMetadataJSON := strings.TrimPrefix(secondEnvelope, "[HARNESS METADATA]\n")
+	secondMetadataJSON, _, _ = strings.Cut(secondMetadataJSON, "\n[/HARNESS METADATA]")
+	var secondMetadata responseEnvelopeMetadata
+	if err := json.Unmarshal([]byte(secondMetadataJSON), &secondMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if secondMetadata.Schedule == nil || len(secondMetadata.Schedule.CompletionRequests) != 1 {
+		t.Fatalf("repeated request was not attached independently: %#v", secondMetadata.Schedule)
+	}
+	secondRequestMetadata := secondMetadata.Schedule.CompletionRequests[0]
+	if !strings.Contains(secondRequestMetadata, `second completion attempt`) ||
+		!strings.Contains(secondRequestMetadata, `Stargazer requests scheduled item #1`) {
+		t.Fatalf("repeated request was lost or reused stale content: %s", secondRequestMetadata)
+	}
+}
+
+func TestScheduleManagerIsReverseChronologicalAndBoundedToWindow(t *testing.T) {
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	now := time.Now()
+	for index := range 12 {
+		if _, err := m.schedule.Add(
+			now.Add(time.Duration(index)*time.Hour),
+			fmt.Sprintf("schedule-row-%02d", index),
+			now,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.width = 80
+	m.height = 18
+	m.resize()
+	m.openScheduleManager(now)
+
+	if len(m.scheduleManagerEntries) != 12 ||
+		m.scheduleManagerEntries[0].Event != "schedule-row-11" ||
+		m.scheduleManagerEntries[len(m.scheduleManagerEntries)-1].Event != "schedule-row-00" {
+		t.Fatalf("schedule is not reverse chronological: %#v", m.scheduleManagerEntries)
+	}
+	rendered := m.renderScheduleManager()
+	if height := strings.Count(rendered, "\n") + 1; height > m.height {
+		t.Fatalf("schedule manager height %d exceeds terminal height %d:\n%s", height, m.height, rendered)
+	}
+	if strings.Contains(rendered, "schedule-row-00") {
+		t.Fatalf("schedule manager rendered rows outside its visible window:\n%s", rendered)
+	}
+}
+
+func TestScheduleManagerGroupsOpenItemsAboveUnselectableDoneItems(t *testing.T) {
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	now := time.Now()
+	oldOpen, err := m.schedule.Add(now.Add(-2*time.Hour), "old open", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newOpen, err := m.schedule.Add(now.Add(2*time.Hour), "new open", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldDone, err := m.schedule.Add(now.Add(-3*time.Hour), "old done", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newDone, err := m.schedule.Add(now.Add(3*time.Hour), "new done", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.schedule.Complete(oldDone.ID, "old item done", "tester", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.schedule.Complete(newDone.ID, "new item done", "tester", now); err != nil {
+		t.Fatal(err)
+	}
+
+	m.width = 100
+	m.height = 30
+	m.resize()
+	m.openScheduleManager(now)
+
+	wantIDs := []int{newOpen.ID, oldOpen.ID, newDone.ID, oldDone.ID}
+	for index, wantID := range wantIDs {
+		if gotID := m.scheduleManagerEntries[index].ID; gotID != wantID {
+			t.Fatalf("entry %d ID = %d, want %d; entries=%#v", index, gotID, wantID, m.scheduleManagerEntries)
+		}
+	}
+	rendered := m.renderScheduleManager()
+	upcomingHeading := strings.Index(rendered, "UPCOMING &amp; DUE")
+	if upcomingHeading < 0 {
+		upcomingHeading = strings.Index(rendered, "UPCOMING & DUE")
+	}
+	doneHeading := strings.Index(rendered, "DONE")
+	if upcomingHeading < 0 || doneHeading < upcomingHeading {
+		t.Fatalf("schedule section headings are missing or out of order:\n%s", rendered)
+	}
+
+	m.scheduleManagerCursor = 2
+	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	got := updated.(appModel)
+	if len(got.scheduleManagerSelected) != 0 {
+		t.Fatalf("done item was selectable: %#v", got.scheduleManagerSelected)
+	}
+	if !strings.Contains(got.status, "already complete and cannot be selected") {
+		t.Fatalf("done-item selection did not explain its disabled state: %q", got.status)
+	}
+}
+
+func TestQueuedUIScheduleCompletionsAreNotLimitedByRecentSnapshot(t *testing.T) {
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	now := time.Now()
+	for index := range maxScheduleCompletedItems + 2 {
+		entry, err := m.schedule.Add(
+			now.Add(time.Duration(index)*time.Minute),
+			fmt.Sprintf("completed item %d", index+1),
+			now,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		completed, err := m.schedule.Complete(entry.ID, "queued completion", "tester", now.Add(time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.pendingScheduleCompletions[completed.ID] = completed
+	}
+
+	enveloped := m.responseEnvelope("deliver every completion", now.Add(2*time.Minute))
+	metadataJSON := strings.TrimPrefix(enveloped, "[HARNESS METADATA]\n")
+	metadataJSON, _, _ = strings.Cut(metadataJSON, "\n[/HARNESS METADATA]")
+	var metadata responseEnvelopeMetadata
+	if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	want := maxScheduleCompletedItems + 2
+	delivered := 0
+	if metadata.Schedule != nil {
+		delivered = len(metadata.Schedule.RecentlyCompleted)
+	}
+	if delivered != want {
+		t.Fatalf("delivered %d queued completions, want %d: %#v", delivered, want, metadata.Schedule)
+	}
+	if len(m.pendingScheduleCompletions) != 0 {
+		t.Fatalf("delivered completion queue was not cleared: %#v", m.pendingScheduleCompletions)
+	}
+}
+
+func TestScheduleManagerCloseReturnsToChat(t *testing.T) {
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	m.phase = phaseChatting
+	m.openScheduleManager(time.Now())
+
+	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Code: 's', Mod: tea.ModCtrl}))
+	got := updated.(appModel)
+	if got.phase != phaseChatting {
+		t.Fatalf("Ctrl+S closed schedule manager into phase %v", got.phase)
+	}
+}
+
+func TestManagedBrowserCaptureReturnsToImageManager(t *testing.T) {
+	m := newAppModel(appConfig{}, testMemoryStore(t))
+	path, err := m.captureVault.SealJPEG(t.TempDir(), testJPEG(t, 12, 8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.phase = phaseCameraWindow
+	m.windowSession = 11
+	m.captureManual = true
+	m.returnToImageManager = true
+	m.imageRequest = &imageRequest{Prompt: "Take a photo", Reason: "Image manager"}
+
+	updated, _ := m.Update(cameraWindowResultMsg{session: 11, path: path})
+	got := updated.(appModel)
+	if got.phase != phaseImageManager || len(got.pendingImages) != 1 {
+		t.Fatalf("managed capture did not return to its queue: phase=%v images=%#v", got.phase, got.pendingImages)
 	}
 }
 
@@ -1750,7 +2769,7 @@ func TestDiscardRemovesOnlyOwnedCapture(t *testing.T) {
 func TestInitialSystemMessages(t *testing.T) {
 	t.Parallel()
 	store := testMemoryStore(t)
-	if _, err := store.Save("likes concise answers", []string{"preference"}); err != nil {
+	if _, err := store.Save("likes concise answers", "preference"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.AppendRecentMessage("user", "last question"); err != nil {
@@ -2153,9 +3172,15 @@ func TestHeartbeatRequestDoesNotAdvertiseSchedulingTool(t *testing.T) {
 		if tool.Function.Name == "request_image" {
 			t.Fatal("heartbeat request advertised request_image")
 		}
+		if tool.Function.Name == "request_tool" {
+			t.Fatal("heartbeat request advertised request_tool")
+		}
 	}
 	if !hasTool(request.Tools, "complete_heartbeat") || request.ToolChoice != "required" {
 		t.Fatalf("heartbeat completion was not structurally required: tools=%#v choice=%#v", request.Tools, request.ToolChoice)
+	}
+	if !hasTool(client.completionTools(true), "request_tool") {
+		t.Fatal("regular completion did not advertise request_tool")
 	}
 }
 
@@ -2194,6 +3219,18 @@ func TestHeartbeatInstructionsDistinguishToolCallsFromResponseContent(t *testing
 		if strings.Contains(guidance, "alongside your final visible response") {
 			t.Errorf("%s still requests mixed text and tool output: %s", name, guidance)
 		}
+	}
+	for _, required := range []string{
+		"No response has been delivered until you use action notify",
+		"action none recurs at the default interval",
+		"action notify stops further heartbeats",
+	} {
+		if !strings.Contains(memoryToolInstructions, required) {
+			t.Errorf("heartbeat system guidance omitted %q", required)
+		}
+	}
+	if strings.Contains(memoryToolInstructions, "visible heartbeat response") {
+		t.Error("heartbeat system guidance still uses ambiguous visible-response language")
 	}
 }
 

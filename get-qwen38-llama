@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+#
+# Download the Qwen3.8-27B heretic GGUF files for llama.cpp vision + MTP
+# inference (0bserverx RVN build, Q6_K with the embedded MTP head), and write
+# a chat2-compatible chat template plus a serve.env profile for ./serve-llama.
+#
+# Files are stored under ./models/qwen3.8-27b by default. Override with
+# QWEN38_MODEL_DIR. Afterwards run:  ./serve-llama --model qwen3.8-27b
+
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MODEL_DIR="${QWEN38_MODEL_DIR:-${PROJECT_DIR}/models/qwen3.8-27b}"
+HF_REPO="0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF"
+HF_BASE="https://huggingface.co/${HF_REPO}/resolve/main"
+
+MODEL_FILE="RVN-Q6_K-mtp.gguf"
+MMPROJ_FILE="mmproj-Qwen3.8-27B-Q8_0.gguf"
+TEMPLATE_FILE="chat_template.jinja"
+PATCHED_TEMPLATE_FILE="chat_template.chat2.jinja"
+
+if ! command -v curl >/dev/null 2>&1; then
+	echo "ERROR: curl is required." >&2
+	exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+	echo "ERROR: python3 is required to patch the chat template." >&2
+	exit 1
+fi
+
+mkdir -p "$MODEL_DIR"
+
+download() {
+	local filename="$1"
+	local size="$2"
+	local destination="${MODEL_DIR}/${filename}"
+	local partial="${destination}.part"
+
+	if [ -f "$destination" ]; then
+		echo "Already downloaded: ${filename}"
+		return
+	fi
+
+	echo "Downloading ${filename} (${size})..."
+	curl \
+		--fail \
+		--location \
+		--retry 3 \
+		--continue-at - \
+		--output "$partial" \
+		"${HF_BASE}/${filename}"
+	mv "$partial" "$destination"
+}
+
+# The stock Qwen 3.8 template raises "System message must be at the beginning"
+# for any later system message. chat2 injects private system messages every
+# turn, so render them as ordinary system blocks instead.
+patch_template() {
+	python3 - "${MODEL_DIR}/${TEMPLATE_FILE}" "${MODEL_DIR}/${PATCHED_TEMPLATE_FILE}" <<'PY'
+import sys
+source, target = sys.argv[1], sys.argv[2]
+text = open(source, encoding="utf-8").read()
+old = """    {%- if message.role == "system" %}
+        {%- if not loop.first %}
+            {{- raise_exception('System message must be at the beginning.') }}
+        {%- endif %}
+"""
+new = """    {%- if message.role == "system" %}
+        {%- if not loop.first and content %}
+            {{- '<|im_start|>system\\n' + content + '<|im_end|>\\n' }}
+        {%- endif %}
+"""
+# chat2's private startup exchange has no user turn at all, only system
+# messages and a response tool, which the stock template also rejects.
+old_user_check = """{%- if ns.multi_step_tool %}
+    {{- raise_exception('No user query found in messages.') }}
+{%- endif %}
+"""
+if old not in text or old_user_check not in text:
+    if new in text:
+        print("Template already patched.")
+    else:
+        sys.exit("ERROR: the chat template no longer matches the expected blocks; patch it by hand.")
+patched = text.replace(old, new).replace(old_user_check, "")
+open(target, "w", encoding="utf-8").write(patched)
+print(f"Wrote chat2-compatible template: {target}")
+PY
+}
+
+echo "=== llama.cpp Qwen3.8-27B download ==="
+echo "Destination: ${MODEL_DIR}"
+echo "Total:       ~23.2 GB"
+echo ""
+
+download "$TEMPLATE_FILE" "9 KB"
+download "$MMPROJ_FILE" "629 MB"
+download "$MODEL_FILE" "22.5 GB"
+patch_template
+
+cat > "${MODEL_DIR}/serve.env" <<'ENV'
+# Sourced by ./serve-llama when this directory is selected.
+MODEL_FILE="RVN-Q6_K-mtp.gguf"
+MMPROJ_FILE="mmproj-Qwen3.8-27B-Q8_0.gguf"
+# The MTP draft head is embedded in the main GGUF; no separate draft file.
+MTP_FILE=""
+MTP_EMBEDDED=1
+# MTP is off by default: on an M4 Pro the draft acceptance on prose was only
+# about 37%, and generation measured 5.5 tok/s with MTP versus 10 tok/s
+# without. Pass ./serve-llama --mtp to try it on your workload.
+MTP_DEFAULT=0
+CHAT_TEMPLATE_FILE="chat_template.chat2.jinja"
+ALIAS="qwen3.8-27b-heretical"
+# llama-server toggles thinking with --reasoning on/off and the template reads
+# a reasoning_effort kwarg. Thinking defaults to medium effort for answer
+# quality; xhigh is the model's own default and costs roughly three times the
+# tokens. Override per run with ./serve-llama --thinking low|medium|xhigh or
+# --no-thinking.
+THINKING_KWARGS=1
+THINKING_DEFAULT="medium"
+# Qwen's recommended sampling for non-thinking and thinking modes.
+SAMPLING=(--temperature 0.7 --top-k 20 --top-p 0.8 --min-p 0 --presence-penalty 1.5)
+THINKING_SAMPLING=(--temperature 1.0 --top-k 20 --top-p 0.95 --min-p 0)
+# llama.cpp warns that Qwen-VL grounding needs at least 1024 image tokens.
+PROFILE_ARGS=(--image-min-tokens 1024)
+ENV
+
+echo ""
+echo "=== Download complete ==="
+echo ""
+echo "Start the server:"
+echo "  ./serve-llama --model qwen3.8-27b"

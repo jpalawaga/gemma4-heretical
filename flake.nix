@@ -1,5 +1,5 @@
 {
-  description = "Local Gemma 4 26B-A4B chat with Ollama and llama.cpp";
+  description = "Local Gemma 4 chat and Kokoro speech tools for Apple Silicon";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -20,6 +20,7 @@
             pkgs.git
             pkgs.cacert
             pkgs.go
+            pkgs.uv
           ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             pkgs.imagesnap
           ];
@@ -49,6 +50,8 @@
             echo "  ./get-gemma4-llama — download the vision + MTP GGUF files"
             echo "  ./serve-llama — serve vision + MTP through llama.cpp"
             echo "  go build -o chat2 ./cmd/chat2 — build the Charm TUI"
+            echo "  go build -o chat3 ./cmd/chat3 — build the basic chat TUI"
+            echo "  ./tts — run local Kokoro text-to-speech"
             echo "  ./abliterate    — run legacy heretic flow on gemma-4-31B-it"
             echo "  ./convert-to-ollama — convert result to GGUF + import to Ollama"
             echo ""

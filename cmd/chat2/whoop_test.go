@@ -14,6 +14,9 @@ import (
 func TestWhoopToolIsExposedOnlyWithUsableToken(t *testing.T) {
 	store := testMemoryStore(t)
 	client := newAPIClient(modelChoice{}, 16384, store, time.Second)
+	if _, _, err := client.EnableCapability("whoop"); err != nil {
+		t.Fatal(err)
+	}
 	if hasTool(client.completionTools(true), "get_whoop_recovery_sleep") {
 		t.Fatal("Whoop tool was exposed before authorization")
 	}

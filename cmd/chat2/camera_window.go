@@ -273,6 +273,8 @@ button:disabled { opacity:.45; cursor:not-allowed }
 video,img { display:block; width:100%; max-height:72vh; object-fit:contain; background:#050609 }
 img[hidden],video[hidden] { display:none }
 .badge { position:absolute; top:14px; left:14px; padding:7px 10px; border-radius:999px; background:#10121acc; color:#86efac; font-size:13px }
+.countdown { position:absolute; inset:0; display:grid; place-items:center; color:#fff; background:#05060966; font-size:clamp(92px,22vw,240px); font-weight:900; line-height:1; text-shadow:0 8px 40px #000 }
+.countdown[hidden] { display:none }
 .actions { display:flex; flex-wrap:wrap; justify-content:center; gap:10px; margin-top:16px }
 #message { min-height:24px; text-align:center; color:#f9a8d4; margin-top:12px }
 #done { text-align:center; padding:80px 20px }
@@ -283,46 +285,65 @@ img[hidden],video[hidden] { display:none }
 <main>
   <header><div><h1>chat2 camera</h1><p>Preview at camera resolution. Nothing is shared until you choose Use Photo.</p></div><select id="device" aria-label="Camera"><option>Default camera</option></select></header>
   <section id="stage">
-    <div class="frame"><video id="video" autoplay playsinline></video><img id="still" alt="Captured preview" hidden><span class="badge" id="badge">LIVE</span></div>
-    <div class="actions"><button id="capture" class="primary" disabled>Capture</button><button id="retake" hidden>Retake</button><button id="use" class="primary" hidden>Use Photo</button><button id="cancel" class="danger">Cancel</button></div>
+    <div class="frame"><video id="video" autoplay playsinline></video><img id="still" alt="Captured preview" hidden><span class="badge" id="badge">LIVE</span><div id="countdown" class="countdown" aria-live="assertive" hidden></div></div>
+    <div class="actions"><button id="capture" class="primary" disabled>Capture</button><button id="timer" disabled>3s Timer</button><button id="retake" hidden>Retake</button><button id="use" class="primary" hidden>Use Photo</button><button id="cancel" class="danger">Cancel</button></div>
     <div id="message" role="status">Requesting camera permission…</div>
   </section>
-  <section id="done" hidden><h1>Photo returned to chat2</h1><p>You can close this window and approve or discard it in the TUI.</p><p><button onclick="window.close()">Close Window</button></p></section>
+  <section id="done" hidden><h1>Photo returned to chat2</h1><p>The photo was accepted. You can close this window.</p><p><button onclick="window.close()">Close Window</button></p></section>
 </main>
 <canvas id="canvas" hidden></canvas>
 <script>
 const get = id => document.getElementById(id);
-const video=get('video'), still=get('still'), canvas=get('canvas'), capture=get('capture'), retake=get('retake'), use=get('use'), cancel=get('cancel'), device=get('device'), message=get('message'), badge=get('badge');
-let stream, photo, completed=false, objectURL;
+const video=get('video'), still=get('still'), canvas=get('canvas'), capture=get('capture'), timer=get('timer'), retake=get('retake'), use=get('use'), cancel=get('cancel'), device=get('device'), message=get('message'), badge=get('badge'), countdown=get('countdown');
+let stream, photo, completed=false, objectURL, countdownGeneration=0;
+const sleep=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
 function stopCamera(){ if(stream) stream.getTracks().forEach(track=>track.stop()); stream=null }
 async function startCamera(deviceId=''){
-  stopCamera(); capture.disabled=true; message.textContent='Opening camera…';
+  cancelCountdown(); stopCamera(); capture.disabled=true; timer.disabled=true; message.textContent='Opening camera…';
   const videoConstraint=deviceId?{deviceId:{exact:deviceId},width:{ideal:1920},height:{ideal:1080}}:{width:{ideal:1920},height:{ideal:1080}};
   stream=await navigator.mediaDevices.getUserMedia({video:videoConstraint,audio:false});
-  video.srcObject=stream; await video.play(); capture.disabled=false;
+  video.srcObject=stream; await video.play(); capture.disabled=false; timer.disabled=false;
   message.textContent=video.videoWidth+' × '+video.videoHeight+' live preview';
   const devices=(await navigator.mediaDevices.enumerateDevices()).filter(item=>item.kind==='videoinput');
   const active=stream.getVideoTracks()[0].getSettings().deviceId;
   device.replaceChildren(...devices.map((item,index)=>{const option=document.createElement('option');option.value=item.deviceId;option.textContent=item.label||('Camera '+(index+1));option.selected=item.deviceId===active;return option}));
 }
-capture.onclick=()=>{
+function captureFrame(){
+  if(completed||photo||!stream)return;
   canvas.width=video.videoWidth; canvas.height=video.videoHeight;
   canvas.getContext('2d').drawImage(video,0,0,canvas.width,canvas.height);
   canvas.toBlob(blob=>{
     photo=blob; if(objectURL) URL.revokeObjectURL(objectURL); objectURL=URL.createObjectURL(blob); still.src=objectURL;
     video.hidden=true; still.hidden=false; badge.textContent='CAPTURED'; badge.style.color='#f9a8d4';
-    capture.hidden=true; retake.hidden=false; use.hidden=false; message.textContent='Review the full-resolution frame before using it.';
+    capture.hidden=true; timer.hidden=true; retake.hidden=false; use.hidden=false; device.disabled=false; message.textContent='Review the full-resolution frame before using it.';
   },'image/jpeg',0.94);
-};
-retake.onclick=()=>{ photo=null; still.hidden=true; video.hidden=false; badge.textContent='LIVE'; badge.style.color='#86efac';capture.hidden=false;retake.hidden=true;use.hidden=true;message.textContent=video.videoWidth+' × '+video.videoHeight+' live preview' };
+}
+function cancelCountdown(){
+  countdownGeneration++; countdown.hidden=true; countdown.textContent=''; device.disabled=false;
+  if(stream&&!photo&&!completed){capture.disabled=false;timer.disabled=false}
+}
+async function timedCapture(){
+  if(completed||photo||!stream)return;
+  const generation=++countdownGeneration;
+  capture.disabled=true; timer.disabled=true; device.disabled=true; countdown.hidden=false;
+  for(let remaining=3;remaining>=1;remaining--){
+    if(generation!==countdownGeneration||completed)return;
+    countdown.textContent=remaining; message.textContent='Capturing in '+remaining+'…';
+    await sleep(1000);
+  }
+  if(generation!==countdownGeneration||completed)return;
+  countdown.hidden=true; countdown.textContent=''; device.disabled=false; captureFrame();
+}
+capture.onclick=captureFrame; timer.onclick=timedCapture;
+retake.onclick=()=>{ cancelCountdown(); photo=null; still.hidden=true; video.hidden=false; badge.textContent='LIVE'; badge.style.color='#86efac';capture.hidden=false;timer.hidden=false;timer.disabled=false;retake.hidden=true;use.hidden=true;message.textContent=video.videoWidth+' × '+video.videoHeight+' live preview' };
 use.onclick=async()=>{
   if(!photo)return; use.disabled=true; message.textContent='Returning photo to chat2…';
-  try { const response=await fetch('capture',{method:'POST',headers:{'Content-Type':'image/jpeg'},body:photo}); if(!response.ok)throw new Error(await response.text()); completed=true; stopCamera(); get('stage').hidden=true; get('done').hidden=false; }
+  try { const response=await fetch('capture',{method:'POST',headers:{'Content-Type':'image/jpeg'},body:photo}); if(!response.ok)throw new Error(await response.text()); completed=true; cancelCountdown(); stopCamera(); get('stage').hidden=true; get('done').hidden=false; }
   catch(error){ use.disabled=false; message.textContent='Could not return photo: '+error.message }
 };
-async function cancelSession(){ if(completed)return; completed=true; stopCamera(); try{await fetch('cancel',{method:'POST',keepalive:true})}catch{} get('stage').hidden=true; get('done').hidden=false; get('done').querySelector('h1').textContent='Capture cancelled'; get('done').querySelector('p').textContent='No photo was kept or returned to chat2.' }
+async function cancelSession(){ if(completed)return; completed=true; cancelCountdown(); stopCamera(); try{await fetch('cancel',{method:'POST',keepalive:true})}catch{} get('stage').hidden=true; get('done').hidden=false; get('done').querySelector('h1').textContent='Capture cancelled'; get('done').querySelector('p').textContent='No photo was kept or returned to chat2.' }
 cancel.onclick=cancelSession; device.onchange=()=>startCamera(device.value).catch(showError);
-function showError(error){ capture.disabled=true; message.textContent='Camera unavailable: '+error.message }
+function showError(error){ capture.disabled=true; timer.disabled=true; message.textContent='Camera unavailable: '+error.message }
 window.addEventListener('keydown',event=>{if(event.key==='Escape')cancelSession()});
 window.addEventListener('beforeunload',()=>{stopCamera();if(!completed)navigator.sendBeacon('cancel')});
 setInterval(async()=>{if(completed)return;try{const response=await fetch('alive',{cache:'no-store'});if(!response.ok)throw new Error()}catch{completed=true;stopCamera();get('stage').hidden=true;get('done').hidden=false;get('done').querySelector('h1').textContent='Camera session closed';get('done').querySelector('p').textContent='The capture was cancelled from chat2. No photo was kept.'}},700);

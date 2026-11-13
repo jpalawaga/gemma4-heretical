@@ -24,14 +24,16 @@ const (
 )
 
 type scheduleEntry struct {
-	ID               int        `json:"id"`
-	Time             time.Time  `json:"time"`
-	Event            string     `json:"event"`
-	CreatedAt        *time.Time `json:"created_at,omitempty"`
-	CompletedAt      *time.Time `json:"completed_at,omitempty"`
-	SeriesID         int        `json:"series_id,omitempty"`
-	RecurrenceUnit   string     `json:"recurrence_unit,omitempty"`
-	RecurrencePeriod int        `json:"recurrence_period,omitempty"`
+	ID                int        `json:"id"`
+	Time              time.Time  `json:"time"`
+	Event             string     `json:"event"`
+	CreatedAt         *time.Time `json:"created_at,omitempty"`
+	CompletedAt       *time.Time `json:"completed_at,omitempty"`
+	CompletionComment string     `json:"completion_comment,omitempty"`
+	CompletedBy       string     `json:"completed_by,omitempty"`
+	SeriesID          int        `json:"series_id,omitempty"`
+	RecurrenceUnit    string     `json:"recurrence_unit,omitempty"`
+	RecurrencePeriod  int        `json:"recurrence_period,omitempty"`
 }
 
 type scheduleSnapshot struct {
@@ -124,9 +126,17 @@ func (s *scheduleStore) AddRecurring(when time.Time, event, unit string, period 
 	return added, err
 }
 
-func (s *scheduleStore) Complete(id int, now time.Time) (scheduleEntry, error) {
+func (s *scheduleStore) Complete(id int, comment, completedBy string, now time.Time) (scheduleEntry, error) {
 	if id <= 0 {
 		return scheduleEntry{}, errors.New("schedule ID must be greater than zero")
+	}
+	comment = strings.TrimSpace(comment)
+	if comment == "" {
+		return scheduleEntry{}, errors.New("completion comment is required")
+	}
+	completedBy = strings.TrimSpace(completedBy)
+	if completedBy == "" {
+		return scheduleEntry{}, errors.New("completion author is required")
 	}
 	var completed scheduleEntry
 	err := s.withLock(func() error {
@@ -144,6 +154,8 @@ func (s *scheduleStore) Complete(id int, now time.Time) (scheduleEntry, error) {
 			}
 			finishedAt := now
 			entries[index].CompletedAt = &finishedAt
+			entries[index].CompletionComment = comment
+			entries[index].CompletedBy = completedBy
 			completed = entries[index]
 			found = true
 			break
@@ -434,14 +446,16 @@ func parseScheduleTime(value string, location *time.Location) (time.Time, error)
 }
 
 type scheduleItemView struct {
-	ID               int    `json:"id"`
-	Time             string `json:"time"`
-	Event            string `json:"event"`
-	Status           string `json:"status"`
-	CompletedAt      string `json:"completed_at,omitempty"`
-	SeriesID         int    `json:"series_id,omitempty"`
-	RecurrenceUnit   string `json:"recurrence_unit,omitempty"`
-	RecurrencePeriod int    `json:"recurrence_period,omitempty"`
+	ID                int    `json:"id"`
+	Time              string `json:"time"`
+	Event             string `json:"event"`
+	Status            string `json:"status"`
+	CompletedAt       string `json:"completed_at,omitempty"`
+	CompletionComment string `json:"completion_comment,omitempty"`
+	CompletedBy       string `json:"completed_by,omitempty"`
+	SeriesID          int    `json:"series_id,omitempty"`
+	RecurrenceUnit    string `json:"recurrence_unit,omitempty"`
+	RecurrencePeriod  int    `json:"recurrence_period,omitempty"`
 }
 
 func scheduleView(entry scheduleEntry, now time.Time) scheduleItemView {
@@ -454,14 +468,16 @@ func scheduleView(entry scheduleEntry, now time.Time) scheduleItemView {
 		status = "due"
 	}
 	return scheduleItemView{
-		ID:               entry.ID,
-		Time:             entry.Time.Format(time.RFC3339),
-		Event:            entry.Event,
-		Status:           status,
-		CompletedAt:      completedAt,
-		SeriesID:         entry.SeriesID,
-		RecurrenceUnit:   entry.RecurrenceUnit,
-		RecurrencePeriod: entry.RecurrencePeriod,
+		ID:                entry.ID,
+		Time:              entry.Time.Format(time.RFC3339),
+		Event:             entry.Event,
+		Status:            status,
+		CompletedAt:       completedAt,
+		CompletionComment: entry.CompletionComment,
+		CompletedBy:       entry.CompletedBy,
+		SeriesID:          entry.SeriesID,
+		RecurrenceUnit:    entry.RecurrenceUnit,
+		RecurrencePeriod:  entry.RecurrencePeriod,
 	}
 }
 

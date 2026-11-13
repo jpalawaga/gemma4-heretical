@@ -5,35 +5,113 @@
 #
 # memory — Manage gemma4-heretical memories from the command line
 #
+# Every memory belongs to one category. Categories are configured in
+# ~/.gemma4-heretical/memory-categories.txt (one "name: description" per
+# line); when that file exists, add/edit/move only accept listed names.
+# Entries from the older tag-based format are mapped onto a category when
+# loaded, the same way chat2 does it: the first tag that is a configured
+# category wins, else the first tag, else "general".
+#
 # Usage:
-#   ./memory list
-#   ./memory add "User prefers dark mode" --tags preferences ui
-#   ./memory search "preferences"
-#   ./memory forget "dark mode"
+#   ./memory list [CATEGORY]
+#   ./memory categories
+#   ./memory add "User prefers dark mode" --category userinfo
+#   ./memory edit 3 --content "..." --category lasts
+#   ./memory move "haircut" lasts
+#   ./memory search "haircut" [--category lasts]
+#   ./memory forget "dark mode" [--category userinfo]
+#   ./memory delete 3
+#
+# Set GEMMA4_MEMORY_DIR to use a different data directory. The categories file
+# location follows chat2's memory_categories_file setting (settings.json) or
+# GEMMA4_MEMORY_CATEGORIES.
 
 import json
 import os
 import sys
 import datetime
 
-DATA_DIR = os.path.expanduser("~/.gemma4-heretical")
+DATA_DIR = os.environ.get("GEMMA4_MEMORY_DIR") or os.path.expanduser("~/.gemma4-heretical")
 MEMORIES_PATH = os.path.join(DATA_DIR, "memories.jsonl")
+SETTINGS_PATH = os.environ.get("GEMMA4_SETTINGS") or os.path.join(DATA_DIR, "settings.json")
+
+
+def categories_path():
+    """Same resolution as chat2: GEMMA4_MEMORY_CATEGORIES, then the
+    memory_categories_file setting, then memory-categories.txt in DATA_DIR."""
+    override = os.environ.get("GEMMA4_MEMORY_CATEGORIES", "").strip()
+    if not override and os.path.exists(SETTINGS_PATH):
+        try:
+            with open(SETTINGS_PATH) as f:
+                override = (json.load(f).get("memory_categories_file") or "").strip()
+        except (OSError, ValueError):
+            override = ""
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(DATA_DIR, "memory-categories.txt")
+
+
+CATEGORIES_PATH = categories_path()
 LAST_MESSAGE_PATH = os.path.join(DATA_DIR, "lastmessage.txt")
 LAST_RESPONSE_PATH = os.path.join(DATA_DIR, "lastresponse.txt")
+DEFAULT_CATEGORY = "general"
+
+
+def normalize(name):
+    return "-".join((name or "").strip().lower().split())
+
+
+def load_categories():
+    """Configured categories as an ordered list of (name, description); [] when free-form."""
+    if not os.path.exists(CATEGORIES_PATH):
+        return []
+    result, seen = [], set()
+    with open(CATEGORIES_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            name, _, description = line.partition(":")
+            name = normalize(name)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            result.append((name, description.strip()))
+    return result
+
+
+def effective_category(m, categories):
+    if normalize(m.get("category")):
+        return normalize(m["category"])
+    names = {name for name, _ in categories}
+    tags = [normalize(t) for t in m.get("tags") or []]
+    for tag in tags:
+        if tag and tag in names:
+            return tag
+    for tag in tags:
+        if tag:
+            return tag
+    return DEFAULT_CATEGORY
+
 
 def load():
     if not os.path.exists(MEMORIES_PATH):
         return []
+    categories = load_categories()
     memories = []
     with open(MEMORIES_PATH) as f:
         for line in f:
             line = line.strip()
-            if line:
-                try:
-                    memories.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+            if not line:
+                continue
+            try:
+                m = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            m["category"] = effective_category(m, categories)
+            memories.append(m)
     return memories
+
 
 def write_all(memories):
     os.makedirs(os.path.dirname(MEMORIES_PATH), exist_ok=True)
@@ -41,118 +119,203 @@ def write_all(memories):
         for m in memories:
             f.write(json.dumps(m) + "\n")
 
+
+def resolve_category(name, required=False):
+    """Validate a category against the configured list. Exits with the allowed names on a mismatch."""
+    name = normalize(name)
+    categories = load_categories()
+    if not name:
+        if required and categories:
+            fail("--category is required; use one of: " + ", ".join(n for n, _ in categories))
+        return DEFAULT_CATEGORY if not categories else None
+    if categories and name not in {n for n, _ in categories}:
+        fail(f"unknown category '{name}'; use one of: " + ", ".join(n for n, _ in categories))
+    return name
+
+
+def fail(message):
+    print("ERROR: " + message, file=sys.stderr)
+    sys.exit(1)
+
+
+def take_option(args, flag):
+    """Remove `flag VALUE` from args and return (value, remaining)."""
+    if flag not in args:
+        return None, args
+    i = args.index(flag)
+    if i + 1 >= len(args):
+        fail(f"{flag} requires a value")
+    return args[i + 1], args[:i] + args[i + 2:]
+
+
 def fmt(m, i=None):
     prefix = f"{i+1:3}. " if i is not None else "  - "
-    tags = f" [tags: {', '.join(m['tags'])}]" if m.get("tags") else ""
-    return f"{prefix}[{m['timestamp']}]{tags}\n     {m['content']}"
+    return f"{prefix}[{m['category']}] {m['content']}\n     {m['timestamp']}"
+
 
 def cmd_list(args):
     memories = load()
+    if args:
+        category = normalize(args[0])
+        matches = [(i, m) for i, m in enumerate(memories) if m["category"] == category]
+        if not matches:
+            print(f"No memories in category '{category}'.")
+            return
+        for i, m in matches:
+            print(fmt(m, i))
+        return
     if not memories:
         print("No memories stored.")
         return
-    for i, m in enumerate(memories):
-        print(fmt(m, i))
+    categories = load_categories()
+    order = [name for name, _ in categories]
+    order += sorted({m["category"] for m in memories} - set(order))
+    for name in order:
+        group = [(i, m) for i, m in enumerate(memories) if m["category"] == name]
+        if not group:
+            continue
+        print(f"== {name} ({len(group)})")
+        for i, m in group:
+            print(fmt(m, i))
+        print()
+
+
+def cmd_categories(args):
+    categories = load_categories()
+    counts = {}
+    for m in load():
+        counts[m["category"]] = counts.get(m["category"], 0) + 1
+    if not categories:
+        print(f"No categories file at {CATEGORIES_PATH}; category names are free-form.")
+        print("Create it with one 'name: description' per line to restrict and describe them,")
+        print("or edit the list in chat2 with F2 > Memory categories. See memory-categories.example.txt.")
+    else:
+        print(f"Configured categories ({CATEGORIES_PATH}):")
+        for name, description in categories:
+            line = f"  {name} ({counts.pop(name, 0)})"
+            if description:
+                line += f": {description}"
+            print(line)
+    if counts:
+        print("Categories in use but not configured:")
+        for name in sorted(counts):
+            print(f"  {name} ({counts[name]})")
+
 
 def cmd_add(args):
-    if not args:
-        print("Usage: ./memory add \"content\" [--tags tag1 tag2 ...]", file=sys.stderr)
-        sys.exit(1)
-    content = args[0]
+    category, args = take_option(args, "--category")
     tags = []
-    if "--tags" in args:
-        tag_start = args.index("--tags") + 1
-        tags = args[tag_start:]
+    if "--tags" in args:  # legacy spelling: the first tag becomes the category
+        i = args.index("--tags")
+        tags = [t for t in args[i + 1:] if not t.startswith("--")]
+        args = args[:i]
+        if category is None and tags:
+            category = tags[0]
+    if not args:
+        fail('Usage: ./memory add "content" --category NAME')
+    content = args[0].strip()
+    if not content:
+        fail("content is required")
+    category = resolve_category(category, required=True)
     os.makedirs(os.path.dirname(MEMORIES_PATH), exist_ok=True)
     entry = {
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "content": content,
-        "tags": tags,
+        "category": category,
     }
     with open(MEMORIES_PATH, "a") as f:
         f.write(json.dumps(entry) + "\n")
-    print(f"Saved: {content}")
+    print(f"Saved in {category}: {content}")
+
 
 def cmd_search(args):
+    category, args = take_option(args, "--category")
     if not args:
-        print("Usage: ./memory search \"query\"", file=sys.stderr)
-        sys.exit(1)
+        fail('Usage: ./memory search "query" [--category NAME]')
     query = args[0].lower()
-    memories = load()
+    category = normalize(category) if category else None
     results = [
-        (i, m) for i, m in enumerate(memories)
-        if query in m["content"].lower() or any(query in t.lower() for t in m.get("tags", []))
+        (i, m) for i, m in enumerate(load())
+        if query in m["content"].lower() and (category is None or m["category"] == category)
     ]
     if not results:
-        print(f"No memories matching '{args[0]}'.")
+        where = f" in category '{category}'" if category else ""
+        print(f"No memories matching '{args[0]}'{where}.")
         return
     for i, m in results:
         print(fmt(m, i))
 
+
 def cmd_forget(args):
+    category, args = take_option(args, "--category")
     if not args:
-        print("Usage: ./memory forget \"query\"", file=sys.stderr)
-        sys.exit(1)
+        fail('Usage: ./memory forget "query" [--category NAME]')
     query = args[0].lower()
+    category = normalize(category) if category else None
     memories = load()
-    kept = [m for m in memories if query not in m["content"].lower()]
+    kept = [
+        m for m in memories
+        if not (query in m["content"].lower() and (category is None or m["category"] == category))
+    ]
     removed = len(memories) - len(kept)
-    write_all(kept)
+    if removed:
+        write_all(kept)
     print(f"Removed {removed} memory entry(s) matching '{args[0]}'.")
 
-def cmd_edit(args):
-    # Usage: ./memory edit <number> [--content "new content"] [--tags tag1 tag2 ...]
+
+def cmd_move(args):
+    if len(args) < 2:
+        fail('Usage: ./memory move "query" CATEGORY')
+    query = args[0].lower()
+    category = resolve_category(args[1], required=True)
+    memories = load()
+    moved = 0
+    for m in memories:
+        if query in m["content"].lower() and m["category"] != category:
+            m["category"] = category
+            moved += 1
+    if moved:
+        write_all(memories)
+    print(f"Moved {moved} memory entry(s) to {category}.")
+
+
+def pick(args, usage):
     if not args:
-        print("Usage: ./memory edit <number> [--content \"...\"] [--tags tag1 tag2 ...]", file=sys.stderr)
-        sys.exit(1)
+        fail(usage)
     try:
         idx = int(args[0]) - 1
     except ValueError:
-        print("ERROR: provide a number from 'list'", file=sys.stderr)
-        sys.exit(1)
+        fail("provide a number from 'list'")
     memories = load()
     if idx < 0 or idx >= len(memories):
-        print(f"ERROR: no memory #{idx+1}", file=sys.stderr)
-        sys.exit(1)
+        fail(f"no memory #{idx+1}")
+    return idx, memories
+
+
+def cmd_edit(args):
+    idx, memories = pick(args, 'Usage: ./memory edit <number> [--content "..."] [--category NAME]')
     rest = args[1:]
-    if not rest:
-        print("ERROR: provide --content and/or --tags to change", file=sys.stderr)
-        sys.exit(1)
+    content, rest = take_option(rest, "--content")
+    category, rest = take_option(rest, "--category")
+    if content is None and category is None:
+        fail("provide --content and/or --category to change")
     m = memories[idx]
-    if "--content" in rest:
-        ci = rest.index("--content")
-        if ci + 1 >= len(rest):
-            print("ERROR: --content requires a value", file=sys.stderr)
-            sys.exit(1)
-        m["content"] = rest[ci + 1]
-    if "--tags" in rest:
-        ti = rest.index("--tags")
-        # collect everything after --tags that isn't another flag
-        tags = []
-        for t in rest[ti + 1:]:
-            if t.startswith("--"):
-                break
-            tags.append(t)
-        m["tags"] = tags
+    if content is not None:
+        if not content.strip():
+            fail("content cannot be empty")
+        m["content"] = content.strip()
+    if category is not None:
+        m["category"] = resolve_category(category, required=True)
     write_all(memories)
     print(fmt(m, idx))
 
+
 def cmd_delete(args):
-    if not args:
-        print("Usage: ./memory delete <number>  (use 'list' to see numbers)", file=sys.stderr)
-        sys.exit(1)
-    try:
-        idx = int(args[0]) - 1
-    except ValueError:
-        print("ERROR: provide a number from 'list'", file=sys.stderr)
-        sys.exit(1)
-    memories = load()
-    if idx < 0 or idx >= len(memories):
-        print(f"ERROR: no memory #{idx+1}", file=sys.stderr)
-        sys.exit(1)
+    idx, memories = pick(args, "Usage: ./memory delete <number>  (use 'list' to see numbers)")
     removed = memories.pop(idx)
     write_all(memories)
     print(f"Deleted: {removed['content']}")
+
 
 def cmd_last_message(args):
     if args and args[0] == "--set":
@@ -167,6 +330,7 @@ def cmd_last_message(args):
     else:
         print("No last message recorded.")
 
+
 def cmd_last_response(args):
     if args and args[0] == "--set":
         content = " ".join(args[1:])
@@ -180,10 +344,13 @@ def cmd_last_response(args):
     else:
         print("No last response recorded.")
 
+
 COMMANDS = {
     "list": cmd_list,
+    "categories": cmd_categories,
     "add": cmd_add,
     "edit": cmd_edit,
+    "move": cmd_move,
     "search": cmd_search,
     "forget": cmd_forget,
     "delete": cmd_delete,
@@ -191,17 +358,22 @@ COMMANDS = {
     "last-response": cmd_last_response,
 }
 
+
 def usage():
     print("Usage: ./memory <command> [args]")
     print("Commands:")
-    print("  list                                        show all memories")
-    print("  add \"content\" [--tags ...]                add a memory")
-    print("  edit <number> [--content \"...\"] [--tags ...]   edit a memory")
-    print("  search \"query\"                             search memories by keyword")
-    print("  forget \"query\"                             remove all memories matching keyword")
-    print("  delete <number>                            delete a specific memory by list number")
-    print("  last-message [--set \"...\"]                view or override last user message")
-    print("  last-response [--set \"...\"]               view or override last assistant response")
+    print("  list [CATEGORY]                                  show memories, grouped by category")
+    print("  categories                                       show configured categories and counts")
+    print("  add \"content\" --category NAME                    add a memory")
+    print("  edit <number> [--content \"...\"] [--category NAME] edit a memory by list number")
+    print("  move \"query\" CATEGORY                            re-file matching memories")
+    print("  search \"query\" [--category NAME]                 search memories by keyword")
+    print("  forget \"query\" [--category NAME]                 remove all memories matching keyword")
+    print("  delete <number>                                  delete a specific memory by list number")
+    print("  last-message [--set \"...\"]                       view or override last user message")
+    print("  last-response [--set \"...\"]                      view or override last assistant response")
+    print(f"Data directory: {DATA_DIR}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:

@@ -1,0 +1,27 @@
+[Unit]
+Description=netwatch internet outage monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/netwatch -log /var/log/netwatch/netwatch.log
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+
+# systemd creates and owns /var/log/netwatch for the dynamic user.
+DynamicUser=yes
+LogsDirectory=netwatch
+
+# Needed only if net.ipv4.ping_group_range excludes the service's GID, in which
+# case netwatch falls back to a raw ICMP socket.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

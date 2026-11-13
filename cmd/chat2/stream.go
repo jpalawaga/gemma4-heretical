@@ -22,6 +22,8 @@ const (
 	streamContentDelta
 	streamToolRound
 	streamFinished
+	// streamNotice carries a progress message in Delta, used by compaction.
+	streamNotice
 )
 
 type completionStreamEvent struct {
@@ -270,17 +272,18 @@ var completeHeartbeatTool = toolSpec{
 	Type: "function",
 	Function: functionSpec{
 		Name:        "complete_heartbeat",
-		Description: "Finish this private heartbeat. Use action none when there is nothing worth surfacing, or action notify with the complete user-facing message. Call this exactly once and alone after any other tools you need.",
+		Description: "Finish this private heartbeat. This tool's notify message is the only channel that can produce a user-visible response: reasoning, drafts, and ordinary assistant prose are never delivered. Use action none only when the user should see nothing, or action notify with the complete user-facing message. Call this exactly once and alone after any other tools you need.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"action": map[string]any{
-					"type": "string",
-					"enum": []string{"none", "notify"},
+					"type":        "string",
+					"enum":        []string{"none", "notify"},
+					"description": `Choose "notify" if the user should receive any response. Choose "none" only when no response should be shown; it discards all reasoning, drafts, and prose.`,
 				},
 				"message": map[string]any{
 					"type":        "string",
-					"description": "The complete message to show the user. Required only for action notify.",
+					"description": "The complete message to show the user. This is the only heartbeat text that reaches the user. Required only for action notify.",
 				},
 			},
 			"required":             []string{"action"},
@@ -313,12 +316,16 @@ func (c *apiClient) completeHeartbeatStreaming(
 	c.nextHeartbeat = nil
 	c.heartbeatSchedulingAllowed = false
 
-	// Heartbeat prose and reasoning are untrusted control-plane output. Only a
-	// validated complete_heartbeat call can become visible to the user.
+	// Heartbeat prose is untrusted control-plane output, so only a validated
+	// complete_heartbeat call can become user-visible. Separated reasoning is
+	// safe to forward because the TUI renders it only in its explicit debug
+	// transcript.
 	heartbeatEmit := func(event completionStreamEvent) bool {
 		switch event.Kind {
-		case streamReasoningDelta, streamContentDelta:
+		case streamContentDelta:
 			return true
+		case streamReasoningDelta:
+			return emit(event)
 		default:
 			return emit(event)
 		}
@@ -334,7 +341,7 @@ func (c *apiClient) completeHeartbeatStreaming(
 			StreamOptions: map[string]any{"include_usage": true},
 		}
 		if c.choice.Backend == backendLlama {
-			request.ReasoningFormat = "none"
+			request.ReasoningFormat = "deepseek"
 		}
 		if c.choice.Backend == backendOllama {
 			request.Options = map[string]any{"num_ctx": c.context}
@@ -389,7 +396,18 @@ func (c *apiClient) completeHeartbeatStreaming(
 				})
 				continue
 			}
+			reply, _ := message.Content.(string)
+			if decision.Action == "none" && strings.TrimSpace(reply) != "" {
+				working = append(working, message, apiMessage{
+					Role:       "tool",
+					ToolCallID: call.ID,
+					Content:    `Heartbeat prose is not user-visible. You selected action "none", which would discard the response you wrote. Retry with action "notify" and copy the complete intended response into message, or omit all response prose if the user should see nothing.`,
+				})
+				continue
+			}
 			result := completionResult{
+				Reply:        "",
+				Reasoning:    message.ReasoningContent,
 				Usage:        roundUsage,
 				Messages:     baseMessages,
 				Notices:      notices,
@@ -407,7 +425,11 @@ func (c *apiClient) completeHeartbeatStreaming(
 		for _, call := range message.ToolCalls {
 			toolNames = append(toolNames, call.Function.Name)
 		}
-		if !emit(completionStreamEvent{Kind: streamToolRound, ToolNames: toolNames}) {
+		if !emit(completionStreamEvent{
+			Kind:      streamToolRound,
+			Reasoning: message.ReasoningContent,
+			ToolNames: toolNames,
+		}) {
 			return completionResult{}, ctx.Err()
 		}
 		for _, call := range message.ToolCalls {
@@ -424,11 +446,14 @@ func (c *apiClient) completeHeartbeatStreaming(
 	return completionResult{}, errors.New("heartbeat tool call limit exceeded")
 }
 
+// heartbeatTools exposes every available tool regardless of capability
+// gating: heartbeats are private maintenance turns, not user conversation.
 func (c *apiClient) heartbeatTools() []toolSpec {
-	available := c.completionTools(false)
+	available := c.availableTools(false, false)
 	result := make([]toolSpec, 0, len(available)+1)
 	for _, tool := range available {
-		if tool.Function.Name == "request_image" {
+		switch tool.Function.Name {
+		case "request_image", "request_tool", "request_toolcall":
 			continue
 		}
 		result = append(result, tool)
@@ -463,7 +488,13 @@ func parseHeartbeatDecision(call toolCall) (heartbeatDecision, error) {
 	return decision, nil
 }
 
+// completionTools returns the tools offered on a regular user turn: core
+// tools plus any capabilities exposed through request_toolcall.
 func (c *apiClient) completionTools(allowHeartbeatScheduling bool) []toolSpec {
+	return c.availableTools(allowHeartbeatScheduling, true)
+}
+
+func (c *apiClient) availableTools(allowHeartbeatScheduling, gated bool) []toolSpec {
 	available := make([]toolSpec, 0, len(tools))
 	for _, tool := range tools {
 		if tool.Function.Name == "schedule_next_heartbeat" && !allowHeartbeatScheduling {
@@ -472,9 +503,52 @@ func (c *apiClient) completionTools(allowHeartbeatScheduling bool) []toolSpec {
 		if tool.Function.Name == "get_whoop_recovery_sleep" && (c.whoop == nil || !c.whoop.Configured(time.Now())) {
 			continue
 		}
+		if gated {
+			if capability, ok := capabilityFor(tool.Function.Name); ok && !c.capabilityEnabled(capability.Name) {
+				continue
+			}
+		}
 		available = append(available, tool)
 	}
+	if c.memory != nil {
+		if categories, err := c.memory.Categories(); err == nil && len(categories) > 0 {
+			names := categoryNames(categories)
+			for index, tool := range available {
+				switch tool.Function.Name {
+				case "save_memory", "move_memory", "update_memory":
+					available[index] = withCategoryEnum(tool, names)
+				}
+			}
+		}
+	}
 	return available
+}
+
+// withCategoryEnum returns a copy of tool whose category parameter is limited
+// to the configured names. The shared package-level spec is left untouched.
+func withCategoryEnum(tool toolSpec, names []string) toolSpec {
+	properties, _ := tool.Function.Parameters["properties"].(map[string]any)
+	category, _ := properties["category"].(map[string]any)
+	if category == nil {
+		return tool
+	}
+	newCategory := make(map[string]any, len(category)+1)
+	for key, value := range category {
+		newCategory[key] = value
+	}
+	newCategory["enum"] = append([]string(nil), names...)
+	newProperties := make(map[string]any, len(properties))
+	for key, value := range properties {
+		newProperties[key] = value
+	}
+	newProperties["category"] = newCategory
+	newParameters := make(map[string]any, len(tool.Function.Parameters))
+	for key, value := range tool.Function.Parameters {
+		newParameters[key] = value
+	}
+	newParameters["properties"] = newProperties
+	tool.Function.Parameters = newParameters
+	return tool
 }
 
 func extractTrailingHeartbeatDirective(content string, now time.Time) (string, time.Time, bool) {

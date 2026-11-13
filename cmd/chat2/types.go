@@ -61,14 +61,23 @@ type transcriptMessage struct {
 	Role       string
 	Content    string
 	Images     []string
+	Chips      []transcriptChip
 	OccurredAt time.Time
 	Meta       string
 }
 
+type transcriptChip struct {
+	Kind  string
+	Label string
+}
+
 type memoryEntry struct {
-	Timestamp string   `json:"timestamp"`
-	Content   string   `json:"content"`
-	Tags      []string `json:"tags,omitempty"`
+	Timestamp string `json:"timestamp"`
+	Content   string `json:"content"`
+	Category  string `json:"category,omitempty"`
+	// Tags is the pre-category format. Legacy entries are mapped onto a
+	// category when loaded; see effectiveCategory.
+	Tags []string `json:"tags,omitempty"`
 }
 
 type recentMessage struct {
@@ -78,17 +87,27 @@ type recentMessage struct {
 }
 
 type appConfig struct {
-	Context               int
-	Heartbeat             time.Duration
-	Debug                 bool
-	SystemFile            string
-	StartupImages         []string
-	OllamaBaseURL         string
-	LlamaBaseURL          string
-	RequestTimeout        time.Duration
-	AllowPlaintextPreview bool
-	WhoopAuth             bool
-	WhoopCallbackListen   string
-	WhoopRedirectURL      string
-	WhoopAuthTimeout      time.Duration
+	SettingsPath               string
+	Settings                   settings
+	PreferredModel             string
+	MemoryCategoriesFile       string
+	CompactTranscript          bool
+	CompactionHistory          int
+	CompactionInstructions     string
+	CompactionInstructionsFile string
+	CompactionThinking         bool
+	Context                    int
+	Heartbeat                  time.Duration
+	Debug                      bool
+	SystemFile                 string
+	StartupImages              []string
+	OllamaBaseURL              string
+	LlamaBaseURL               string
+	RequestTimeout             time.Duration
+	AllowPlaintextPreview      bool
+	LeanTools                  bool
+	WhoopAuth                  bool
+	WhoopCallbackListen        string
+	WhoopRedirectURL           string
+	WhoopAuthTimeout           time.Duration
 }
